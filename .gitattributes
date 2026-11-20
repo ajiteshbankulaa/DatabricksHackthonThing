@@ -1,0 +1,8 @@
+# Preserve exact bytes in fixtures (E20 specifically tests literal CR bytes in CSV fields)
+**/fixtures/** -text
+fixtures/** -text
+
+# Keep Linux container scripts and build files LF
+*.sh text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf

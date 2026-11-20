@@ -1,0 +1,18 @@
+# Generated datasets and outputs (repo must stay <= 50 MB for scorer)
+dev/
+out/
+scratch/
+*.parquet
+
+# Rust generator build output
+target/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
