@@ -1,6 +1,15 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+use std::time::Instant;
+
+#[derive(Default, Clone, Copy)]
+pub struct ParquetStats {
+    pub user_ns: u64,
+    pub campaign_ns: u64,
+    pub user_daily_rows: usize,
+    pub campaign_daily_rows: usize,
+}
 
 use crate::id::append_id_bytes;
 use crate::lookup::{Lookups, NON_PURCHASE_CAT};
@@ -527,7 +536,7 @@ pub fn write_campaign_daily(
     path: &Path,
     stats: &[CampaignDayStat],
     lookups: &Lookups,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let num_campaigns = lookups.campaigns.len();
     let num_days = lookups.num_days;
     let start_epoch_day = lookups.start_epoch_day;
@@ -655,7 +664,7 @@ pub fn write_campaign_daily(
     w.write_all(&(meta.len() as i32).to_le_bytes())?;
     w.write_all(b"PAR1")?;
     w.flush()?;
-    Ok(())
+    Ok(num_rows as usize)
 }
 
 pub fn write_all_outputs(
@@ -663,33 +672,64 @@ pub fn write_all_outputs(
     user_buffers: &[UserDailyBuffer],
     campaign_stats: &[CampaignDayStat],
     lookups: &Lookups,
-) -> io::Result<()> {
+    timing: bool,
+) -> io::Result<ParquetStats> {
     let ud_dir = out_dir.join("user_daily");
     let cd_dir = out_dir.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir)?;
     std::fs::create_dir_all(&cd_dir)?;
 
+    let user_daily_rows: usize = user_buffers.iter().map(|b| b.len()).sum();
+    let wall_t0 = if timing { Some(Instant::now()) } else { None };
+    let mut campaign_daily_rows = 0usize;
+    let mut u_cpu_ns = 0u64;
+    let mut c_cpu_ns = 0u64;
+
     if user_buffers.is_empty() {
         let empty = UserDailyBuffer::default();
+        let t_u = if timing { Some(Instant::now()) } else { None };
         write_user_daily_part(&ud_dir.join("part-0.parquet"), &empty, lookups)?;
-        write_campaign_daily(&cd_dir.join("part-0.parquet"), campaign_stats, lookups)?;
+        if let Some(t) = t_u {
+            u_cpu_ns = t.elapsed().as_nanos() as u64;
+        }
+        let t_c = if timing { Some(Instant::now()) } else { None };
+        campaign_daily_rows =
+            write_campaign_daily(&cd_dir.join("part-0.parquet"), campaign_stats, lookups)?;
+        if let Some(t) = t_c {
+            c_cpu_ns = t.elapsed().as_nanos() as u64;
+        }
     } else {
         std::thread::scope(|s| -> io::Result<()> {
-            let mut handles = Vec::with_capacity(user_buffers.len() + 1);
+            let mut u_handles = Vec::with_capacity(user_buffers.len());
             for (i, buf) in user_buffers.iter().enumerate() {
                 let p = ud_dir.join(format!("part-{i}.parquet"));
-                handles.push(s.spawn(move || write_user_daily_part(&p, buf, lookups)));
+                u_handles.push(s.spawn(move || -> io::Result<u64> {
+                    let t = if timing { Some(Instant::now()) } else { None };
+                    write_user_daily_part(&p, buf, lookups)?;
+                    Ok(t.map(|x| x.elapsed().as_nanos() as u64).unwrap_or(0))
+                }));
             }
             let cd_path = cd_dir.join("part-0.parquet");
-            handles.push(s.spawn(move || {
-                write_campaign_daily(&cd_path, campaign_stats, lookups)
-            }));
-            for h in handles {
-                h.join().unwrap()?;
+            let c_handle = s.spawn(move || -> io::Result<(usize, u64)> {
+                let t = if timing { Some(Instant::now()) } else { None };
+                let rows = write_campaign_daily(&cd_path, campaign_stats, lookups)?;
+                Ok((rows, t.map(|x| x.elapsed().as_nanos() as u64).unwrap_or(0)))
+            });
+            for h in u_handles {
+                u_cpu_ns = u_cpu_ns.max(h.join().unwrap()?);
             }
+            let (rows, c_ns) = c_handle.join().unwrap()?;
+            campaign_daily_rows = rows;
+            c_cpu_ns = c_ns;
             Ok(())
         })?;
     }
 
-    Ok(())
+    let _wall_ns = wall_t0.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+    Ok(ParquetStats {
+        user_ns: u_cpu_ns,
+        campaign_ns: c_cpu_ns,
+        user_daily_rows,
+        campaign_daily_rows,
+    })
 }

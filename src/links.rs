@@ -2,9 +2,18 @@ use std::cmp::Ordering;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+use std::time::Instant;
 
 use crate::csv::{build_chunks, list_csv_files, read_exact_at, scan_csv_chunk};
 use crate::id::{EMPTY_ID, cmp_id, mix64, pack_id};
+
+#[derive(Default, Clone, Copy)]
+pub struct LinkStats {
+    pub scan_ns: u64,
+    pub dsu_ns: u64,
+    pub edges: usize,
+    pub nodes: usize,
+}
 
 #[derive(Clone, Copy)]
 struct LinkSlot {
@@ -15,6 +24,7 @@ struct LinkSlot {
 pub struct LinkMap {
     slots: Vec<LinkSlot>,
     mask: usize,
+    pub stats: LinkStats,
 }
 
 impl LinkMap {
@@ -22,6 +32,7 @@ impl LinkMap {
         Self {
             slots: Vec::new(),
             mask: 0,
+            stats: LinkStats::default(),
         }
     }
 
@@ -43,7 +54,8 @@ impl LinkMap {
         }
     }
 
-    pub fn build(data_dir: &Path, ncpu: usize) -> io::Result<Self> {
+    pub fn build(data_dir: &Path, ncpu: usize, timing: bool) -> io::Result<Self> {
+        let t0 = if timing { Some(Instant::now()) } else { None };
         let paths = list_csv_files(&data_dir.join("links"))?;
         if paths.is_empty() {
             return Ok(Self::empty());
@@ -98,7 +110,12 @@ impl LinkMap {
             Ok::<_, io::Error>(out)
         })?;
 
-        Ok(Self::from_edge_vecs(&edge_vecs))
+        let scan_ns = t0.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        let t1 = if timing { Some(Instant::now()) } else { None };
+        let mut map = Self::from_edge_vecs(&edge_vecs);
+        map.stats.scan_ns = scan_ns;
+        map.stats.dsu_ns = t1.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        Ok(map)
     }
 
     pub fn from_edge_vecs(edge_vecs: &[Vec<(u64, u64)>]) -> Self {
@@ -181,7 +198,16 @@ impl LinkMap {
             }
         }
 
-        Self { slots, mask }
+        Self {
+            slots,
+            mask,
+            stats: LinkStats {
+                scan_ns: 0,
+                dsu_ns: 0,
+                edges: total_edges,
+                nodes: num_nodes,
+            },
+        }
     }
 }
 

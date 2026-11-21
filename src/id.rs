@@ -1,10 +1,17 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
 use std::sync::{Mutex, OnceLock};
 
 pub const EMPTY_ID: u64 = 0;
 const FALLBACK_BIT: u64 = 1u64 << 63;
 const NUM_SHARDS: usize = 64;
+static FALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[inline(always)]
+pub fn fallback_calls() -> usize {
+    FALLBACK_CALLS.load(AtomicOrd::Relaxed)
+}
 
 #[inline(always)]
 pub fn is_fallback(id: u64) -> bool {
@@ -48,6 +55,7 @@ impl IdInterner {
     #[cold]
     #[inline(never)]
     pub fn intern_fallback(&self, bytes: &[u8]) -> u64 {
+        FALLBACK_CALLS.fetch_add(1, AtomicOrd::Relaxed);
         let h = fnv1a_64(bytes);
         let shard_idx = (h as usize) & (NUM_SHARDS - 1);
         let mut guard = self.shards[shard_idx].lock().unwrap();
