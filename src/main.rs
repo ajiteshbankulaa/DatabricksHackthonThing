@@ -50,6 +50,7 @@ fn run() -> io::Result<()> {
     let scan_out = scan::scan_events_and_clicks(&data_dir, &lookups, &link_map, ncpu, timing)?;
     let dedup_out = dedup::dedup_events(
         scan_out.event_shards,
+        scan_out.ingest_shards,
         scan_out.num_threads,
         &link_map,
         ncpu,

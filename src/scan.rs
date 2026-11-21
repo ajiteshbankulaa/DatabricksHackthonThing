@@ -19,7 +19,6 @@ const SCAN_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 #[derive(Clone, Copy)]
 pub struct RawEvent {
     pub event_id: u64,
-    pub ingest_ts: i64,
     pub user_id: u64,
     pub rel_ts: u32,
     pub price_and_cat: u32,
@@ -185,6 +184,8 @@ pub struct ScanStats {
 pub struct ScanOutput {
     /// Flat array of `num_threads * EVENT_BUCKETS` vectors.
     pub event_shards: Vec<Vec<RawEvent>>,
+    /// Parallel `ingest_sec` (seconds relative to `window_start`) for `event_shards`.
+    pub ingest_shards: Vec<Vec<i32>>,
     /// Flat array of `num_threads * USER_BUCKETS` vectors.
     pub click_shards: Vec<Vec<CleanClick>>,
     pub num_threads: usize,
@@ -213,6 +214,7 @@ pub fn scan_events_and_clicks(
     if tasks.is_empty() {
         return Ok(ScanOutput {
             event_shards: Vec::new(),
+            ingest_shards: Vec::new(),
             click_shards: Vec::new(),
             num_threads: 0,
             stats: ScanStats {
@@ -225,6 +227,7 @@ pub fn scan_events_and_clicks(
     tasks.sort_unstable_by(|a, b| (b.end - b.start).cmp(&(a.end - a.start)));
     let num_threads = ncpu.min(tasks.len()).max(1);
     let next_task = AtomicUsize::new(0);
+    let window_start_sec = lookups.window_start.div_euclid(1000);
 
     let total_event_bytes: u64 = event_lens.iter().sum();
     let total_click_bytes: u64 = click_lens.iter().sum();
@@ -239,168 +242,186 @@ pub fn scan_events_and_clicks(
         0
     };
 
-    let thread_results: Vec<(Vec<Vec<RawEvent>>, Vec<Vec<CleanClick>>, u64, u64)> =
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(num_threads);
-            for _ in 0..num_threads {
-                handles.push(s.spawn(
-                    || -> io::Result<(Vec<Vec<RawEvent>>, Vec<Vec<CleanClick>>, u64, u64)> {
-                        let mut buf: Vec<u8> = Vec::new();
-                        let mut ev_buckets: Vec<Vec<RawEvent>> = (0..EVENT_BUCKETS)
-                            .map(|_| Vec::with_capacity(ev_cap))
-                            .collect();
-                        let mut ck_buckets: Vec<Vec<CleanClick>> = (0..USER_BUCKETS)
-                            .map(|_| Vec::with_capacity(ck_cap))
-                            .collect();
-                        let mut ev_cpu_ns = 0u64;
-                        let mut ck_cpu_ns = 0u64;
+    let thread_results: Vec<(
+        Vec<Vec<RawEvent>>,
+        Vec<Vec<i32>>,
+        Vec<Vec<CleanClick>>,
+        u64,
+        u64,
+    )> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for _ in 0..num_threads {
+            handles.push(s.spawn(
+                || -> io::Result<(
+                    Vec<Vec<RawEvent>>,
+                    Vec<Vec<i32>>,
+                    Vec<Vec<CleanClick>>,
+                    u64,
+                    u64,
+                )> {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut ev_buckets: Vec<Vec<RawEvent>> = (0..EVENT_BUCKETS)
+                        .map(|_| Vec::with_capacity(ev_cap))
+                        .collect();
+                    let mut ing_buckets: Vec<Vec<i32>> = (0..EVENT_BUCKETS)
+                        .map(|_| Vec::with_capacity(ev_cap))
+                        .collect();
+                    let mut ck_buckets: Vec<Vec<CleanClick>> = (0..USER_BUCKETS)
+                        .map(|_| Vec::with_capacity(ck_cap))
+                        .collect();
+                    let mut ev_cpu_ns = 0u64;
+                    let mut ck_cpu_ns = 0u64;
 
-                        loop {
-                            let tidx = next_task.fetch_add(1, Ordering::Relaxed);
-                            let Some(task) = tasks.get(tidx) else {
-                                break;
-                            };
-                            let len = (task.end - task.start) as usize;
-                            if len == 0 {
-                                continue;
-                            }
-                            let c_t0 = if timing { Some(Instant::now()) } else { None };
-                            if buf.len() < len + 64 {
-                                buf.resize(len + 64, 0);
-                            }
-                            let bank = match task.kind {
-                                TaskKind::Event => &event_bank,
-                                TaskKind::Click => &click_bank,
-                            };
-                            let n = bank.read_chunk(task.file_idx, task.start, &mut buf[..len])?;
-                            buf[n..n + 64].fill(0);
+                    loop {
+                        let tidx = next_task.fetch_add(1, Ordering::Relaxed);
+                        let Some(task) = tasks.get(tidx) else {
+                            break;
+                        };
+                        let len = (task.end - task.start) as usize;
+                        if len == 0 {
+                            continue;
+                        }
+                        let c_t0 = if timing { Some(Instant::now()) } else { None };
+                        if buf.len() < len + 64 {
+                            buf.resize(len + 64, 0);
+                        }
+                        let bank = match task.kind {
+                            TaskKind::Event => &event_bank,
+                            TaskKind::Click => &click_bank,
+                        };
+                        let n = bank.read_chunk(task.file_idx, task.start, &mut buf[..len])?;
+                        buf[n..n + 64].fill(0);
 
-                            match task.kind {
-                                TaskKind::Event => {
-                                    scan_csv_chunk::<7, _>(&buf, n, |f| {
-                                        if f[0].is_empty() {
-                                            return;
-                                        }
-                                        let Some(ingest_ts) = parse_f1(f[3]) else {
-                                            return;
-                                        };
-                                        let event_id = pack_id(f[0]);
-                                        let mut valid = !f[1].is_empty();
-                                        let mut rel_ts = 0u32;
-                                        if valid {
-                                            if let Some(ts) = parse_ts(f[2]) {
-                                                if ts >= lookups.window_start
-                                                    && ts < lookups.window_end
-                                                    && ingest_ts - ts <= DAY_MS
-                                                {
-                                                    rel_ts = (ts - lookups.window_start) as u32;
-                                                } else {
-                                                    valid = false;
-                                                }
+                        match task.kind {
+                            TaskKind::Event => {
+                                scan_csv_chunk::<7, _>(&buf, n, |f| {
+                                    if f[0].is_empty() {
+                                        return;
+                                    }
+                                    let Some(ingest_ts) = parse_f1(f[3]) else {
+                                        return;
+                                    };
+                                    let event_id = pack_id(f[0]);
+                                    let mut valid = !f[1].is_empty();
+                                    let mut rel_ts = 0u32;
+                                    if valid {
+                                        if let Some(ts) = parse_ts(f[2]) {
+                                            if ts >= lookups.window_start
+                                                && ts < lookups.window_end
+                                                && ingest_ts - ts <= DAY_MS
+                                            {
+                                                rel_ts = (ts - lookups.window_start) as u32;
                                             } else {
                                                 valid = false;
                                             }
+                                        } else {
+                                            valid = false;
                                         }
-                                        let mut price_and_cat = NON_PURCHASE_CAT as u32;
-                                        if valid {
-                                            if f[5].is_empty() {
-                                                valid = false;
-                                            } else {
-                                                match f[4] {
-                                                    b"view" | b"cart" => {}
-                                                    b"purchase" => {
-                                                        if let Some(price) = parse_price_cents(f[6])
-                                                        {
-                                                            let cat = lookups.lookup_product(f[5]);
-                                                            price_and_cat =
-                                                                (price << 8) | (cat as u32);
-                                                        } else {
-                                                            valid = false;
-                                                        }
+                                    }
+                                    let mut price_and_cat = NON_PURCHASE_CAT as u32;
+                                    if valid {
+                                        if f[5].is_empty() {
+                                            valid = false;
+                                        } else {
+                                            match f[4] {
+                                                b"view" | b"cart" => {}
+                                                b"purchase" => {
+                                                    if let Some(price) = parse_price_cents(f[6]) {
+                                                        let cat = lookups.lookup_product(f[5]);
+                                                        price_and_cat =
+                                                            (price << 8) | (cat as u32);
+                                                    } else {
+                                                        valid = false;
                                                     }
-                                                    _ => valid = false,
                                                 }
+                                                _ => valid = false,
                                             }
                                         }
-                                        let raw = RawEvent {
-                                            event_id,
-                                            ingest_ts,
-                                            user_id: if valid {
-                                                pack_id(f[1])
-                                            } else {
-                                                EMPTY_ID
-                                            },
-                                            rel_ts,
-                                            price_and_cat: if valid {
-                                                price_and_cat
-                                            } else {
-                                                INVALID_MARKER
-                                            },
-                                        };
-                                        let b = (mix64(event_id) as usize) & (EVENT_BUCKETS - 1);
-                                        unsafe {
-                                            ev_buckets.get_unchecked_mut(b).push(raw);
-                                        }
-                                    });
-                                    if let Some(t) = c_t0 {
-                                        ev_cpu_ns += t.elapsed().as_nanos() as u64;
                                     }
+                                    let ingest_sec = (ingest_ts.div_euclid(1000)
+                                        - window_start_sec)
+                                        .clamp(i32::MIN as i64, i32::MAX as i64)
+                                        as i32;
+                                    let raw = RawEvent {
+                                        event_id,
+                                        user_id: if valid {
+                                            pack_id(f[1])
+                                        } else {
+                                            EMPTY_ID
+                                        },
+                                        rel_ts,
+                                        price_and_cat: if valid {
+                                            price_and_cat
+                                        } else {
+                                            INVALID_MARKER
+                                        },
+                                    };
+                                    let b = (mix64(event_id) as usize) & (EVENT_BUCKETS - 1);
+                                    unsafe {
+                                        ev_buckets.get_unchecked_mut(b).push(raw);
+                                        ing_buckets.get_unchecked_mut(b).push(ingest_sec);
+                                    }
+                                });
+                                if let Some(t) = c_t0 {
+                                    ev_cpu_ns += t.elapsed().as_nanos() as u64;
                                 }
-                                TaskKind::Click => {
-                                    scan_csv_chunk::<4, _>(&buf, n, |f| {
-                                        if f[0].is_empty() || f[1].is_empty() {
-                                            return;
-                                        }
-                                        let campaign_idx = lookups.lookup_campaign(f[2]);
-                                        if campaign_idx == 0 {
-                                            return;
-                                        }
-                                        let Some(ts) = parse_ts(f[3]) else {
-                                            return;
-                                        };
-                                        if ts < lookups.click_start || ts >= lookups.click_end {
-                                            return;
-                                        }
-                                        let click_id = pack_id(f[0]);
-                                        let canonical_user = link_map.resolve(pack_id(f[1]));
-                                        let rel_ts = (ts - lookups.click_start) as u32;
-                                        let b =
-                                            (mix64(canonical_user) as usize) & (USER_BUCKETS - 1);
-                                        unsafe {
-                                            ck_buckets.get_unchecked_mut(b).push(CleanClick {
-                                                canonical_user,
-                                                click_id,
-                                                rel_ts,
-                                                campaign_idx,
-                                            });
-                                        }
-                                    });
-                                    if let Some(t) = c_t0 {
-                                        ck_cpu_ns += t.elapsed().as_nanos() as u64;
+                            }
+                            TaskKind::Click => {
+                                scan_csv_chunk::<4, _>(&buf, n, |f| {
+                                    if f[0].is_empty() || f[1].is_empty() {
+                                        return;
                                     }
+                                    let campaign_idx = lookups.lookup_campaign(f[2]);
+                                    if campaign_idx == 0 {
+                                        return;
+                                    }
+                                    let Some(ts) = parse_ts(f[3]) else {
+                                        return;
+                                    };
+                                    if ts < lookups.click_start || ts >= lookups.click_end {
+                                        return;
+                                    }
+                                    let click_id = pack_id(f[0]);
+                                    let canonical_user = link_map.resolve(pack_id(f[1]));
+                                    let rel_ts = (ts - lookups.click_start) as u32;
+                                    let b =
+                                        (mix64(canonical_user) as usize) & (USER_BUCKETS - 1);
+                                    unsafe {
+                                        ck_buckets.get_unchecked_mut(b).push(CleanClick {
+                                            canonical_user,
+                                            click_id,
+                                            rel_ts,
+                                            campaign_idx,
+                                        });
+                                    }
+                                });
+                                if let Some(t) = c_t0 {
+                                    ck_cpu_ns += t.elapsed().as_nanos() as u64;
                                 }
                             }
                         }
+                    }
 
-                        Ok((ev_buckets, ck_buckets, ev_cpu_ns, ck_cpu_ns))
-                    },
-                ));
-            }
+                    Ok((ev_buckets, ing_buckets, ck_buckets, ev_cpu_ns, ck_cpu_ns))
+                },
+            ));
+        }
 
-            let mut out = Vec::with_capacity(num_threads);
-            for h in handles {
-                out.push(h.join().unwrap()?);
-            }
-            Ok::<_, io::Error>(out)
-        })?;
+        let mut out = Vec::with_capacity(num_threads);
+        for h in handles {
+            out.push(h.join().unwrap()?);
+        }
+        Ok::<_, io::Error>(out)
+    })?;
 
     let mut event_shards = Vec::with_capacity(num_threads * EVENT_BUCKETS);
+    let mut ingest_shards = Vec::with_capacity(num_threads * EVENT_BUCKETS);
     let mut click_shards = Vec::with_capacity(num_threads * USER_BUCKETS);
     let mut ev_cpu_sum = 0u64;
     let mut ck_cpu_sum = 0u64;
     let mut raw_events = 0usize;
     let mut valid_clicks = 0usize;
-    for (evs, cks, ev_ns, ck_ns) in thread_results {
+    for (evs, ings, cks, ev_ns, ck_ns) in thread_results {
         ev_cpu_sum += ev_ns;
         ck_cpu_sum += ck_ns;
         if timing {
@@ -408,6 +429,7 @@ pub fn scan_events_and_clicks(
             valid_clicks += cks.iter().map(|v| v.len()).sum::<usize>();
         }
         event_shards.extend(evs);
+        ingest_shards.extend(ings);
         click_shards.extend(cks);
     }
 
@@ -418,6 +440,7 @@ pub fn scan_events_and_clicks(
 
     Ok(ScanOutput {
         event_shards,
+        ingest_shards,
         click_shards,
         num_threads,
         stats: ScanStats {

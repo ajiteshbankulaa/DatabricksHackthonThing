@@ -5,6 +5,9 @@ use crate::id::{EMPTY_ID, mix64};
 use crate::links::LinkMap;
 use crate::scan::{EVENT_BUCKETS, INVALID_MARKER, RawEvent, USER_BUCKETS};
 
+const SUB_PARTITIONS: usize = 16;
+const PREFETCH_DIST: usize = 16;
+
 #[derive(Default, Clone, Copy)]
 pub struct DedupStats {
     pub hash_ns: u64,
@@ -24,14 +27,14 @@ pub struct CleanEvent {
 #[derive(Clone, Copy)]
 struct DedupSlot {
     key: u64,
-    shard: u32,
-    row: u32,
+    min_ingest: i32,
+    row_idx: u32,
 }
 
 const EMPTY_SLOT: DedupSlot = DedupSlot {
     key: EMPTY_ID,
-    shard: 0,
-    row: 0,
+    min_ingest: 0,
+    row_idx: 0,
 };
 
 pub struct DedupOutput {
@@ -41,8 +44,122 @@ pub struct DedupOutput {
     pub stats: DedupStats,
 }
 
+#[inline(always)]
+fn prefetch_slot(slots: &[DedupSlot], idx: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let ptr = slots.as_ptr().add(idx) as *const i8;
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (slots, idx);
+}
+
+fn dedup_slice_into_buckets(
+    raw: &[RawEvent],
+    ing: &[i32],
+    slots: &mut Vec<DedupSlot>,
+    occupied: &mut Vec<u32>,
+    link_map: &LinkMap,
+    user_buckets: &mut [Vec<CleanEvent>],
+    pending: &mut Vec<RawEvent>,
+    timing: bool,
+    hash_cpu_ns: &mut u64,
+    scatter_cpu_ns: &mut u64,
+    unique_valid: &mut usize,
+) {
+    let n = raw.len();
+    if n == 0 {
+        return;
+    }
+
+    let h_t0 = if timing { Some(Instant::now()) } else { None };
+    let needed = (n * 2).next_power_of_two().max(64);
+    if slots.len() < needed {
+        slots.resize(needed, EMPTY_SLOT);
+    }
+    let mask = needed - 1;
+    occupied.clear();
+
+    for i in 0..n {
+        if i + PREFETCH_DIST < n {
+            let p_id = unsafe { raw.get_unchecked(i + PREFETCH_DIST).event_id };
+            let p_idx = ((mix64(p_id) >> 16) as usize) & mask;
+            prefetch_slot(slots, p_idx);
+        }
+        let ev = unsafe { *raw.get_unchecked(i) };
+        let ev_ing = unsafe { *ing.get_unchecked(i) };
+        let mut idx = ((mix64(ev.event_id) >> 16) as usize) & mask;
+        loop {
+            let slot = unsafe { *slots.get_unchecked(idx) };
+            if slot.key == EMPTY_ID {
+                unsafe {
+                    *slots.get_unchecked_mut(idx) = DedupSlot {
+                        key: ev.event_id,
+                        min_ingest: ev_ing,
+                        row_idx: i as u32,
+                    };
+                }
+                occupied.push(idx as u32);
+                break;
+            }
+            if slot.key == ev.event_id {
+                if ev_ing < slot.min_ingest {
+                    unsafe {
+                        let s_mut = slots.get_unchecked_mut(idx);
+                        s_mut.min_ingest = ev_ing;
+                        s_mut.row_idx = i as u32;
+                    }
+                }
+                break;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+    if let Some(t) = h_t0 {
+        *hash_cpu_ns += t.elapsed().as_nanos() as u64;
+    }
+
+    let s_t0 = if timing { Some(Instant::now()) } else { None };
+    pending.clear();
+    for &slot_idx in occupied.iter() {
+        let slot = unsafe { *slots.get_unchecked(slot_idx as usize) };
+        let ev = unsafe { *raw.get_unchecked(slot.row_idx as usize) };
+        unsafe {
+            slots.get_unchecked_mut(slot_idx as usize).key = EMPTY_ID;
+        }
+        if ev.price_and_cat != INVALID_MARKER {
+            pending.push(ev);
+        }
+    }
+
+    let plen = pending.len();
+    for j in 0..plen {
+        if j + PREFETCH_DIST < plen {
+            link_map.prefetch(unsafe { pending.get_unchecked(j + PREFETCH_DIST).user_id });
+        }
+        let ev = unsafe { *pending.get_unchecked(j) };
+        let canonical_user = link_map.resolve(ev.user_id);
+        let ub = (mix64(canonical_user) as usize) & (USER_BUCKETS - 1);
+        unsafe {
+            user_buckets.get_unchecked_mut(ub).push(CleanEvent {
+                canonical_user,
+                rel_ts: ev.rel_ts,
+                price_and_cat: ev.price_and_cat,
+            });
+        }
+    }
+    if timing {
+        *unique_valid += plen;
+        if let Some(t) = s_t0 {
+            *scatter_cpu_ns += t.elapsed().as_nanos() as u64;
+        }
+    }
+}
+
 pub fn dedup_events(
     raw_shards: Vec<Vec<RawEvent>>,
+    ingest_shards: Vec<Vec<i32>>,
     scan_threads: usize,
     link_map: &LinkMap,
     ncpu: usize,
@@ -72,6 +189,11 @@ pub fn dedup_events(
             handles.push(s.spawn(|| {
                 let mut slots: Vec<DedupSlot> = Vec::new();
                 let mut occupied: Vec<u32> = Vec::new();
+                let mut pending: Vec<RawEvent> = Vec::new();
+                let mut flat_raw: Vec<RawEvent> = Vec::new();
+                let mut flat_ing: Vec<i32> = Vec::new();
+                let mut sub_raw: Vec<RawEvent> = Vec::new();
+                let mut sub_ing: Vec<i32> = Vec::new();
                 let mut user_buckets: Vec<Vec<CleanEvent>> = (0..USER_BUCKETS)
                     .map(|_| Vec::with_capacity(user_cap))
                     .collect();
@@ -93,82 +215,96 @@ pub fn dedup_events(
                         continue;
                     }
 
-                    let h_t0 = if timing { Some(Instant::now()) } else { None };
-                    let needed = (total_rows * 2).next_power_of_two().max(64);
-                    if slots.len() < needed {
-                        slots.resize(needed, EMPTY_SLOT);
-                    }
-                    let mask = needed - 1;
-                    occupied.clear();
-
-                    for t in 0..scan_threads {
-                        let slice = &raw_shards[t * EVENT_BUCKETS + b];
-                        for (r_idx, ev) in slice.iter().enumerate() {
-                            let mut idx = (mix64(ev.event_id) as usize) & mask;
-                            loop {
-                                let slot = unsafe { *slots.get_unchecked(idx) };
-                                if slot.key == EMPTY_ID {
-                                    unsafe {
-                                        *slots.get_unchecked_mut(idx) = DedupSlot {
-                                            key: ev.event_id,
-                                            shard: t as u32,
-                                            row: r_idx as u32,
-                                        };
-                                    }
-                                    occupied.push(idx as u32);
-                                    break;
-                                }
-                                if slot.key == ev.event_id {
-                                    let prev = unsafe {
-                                        raw_shards
-                                            .get_unchecked(slot.shard as usize * EVENT_BUCKETS + b)
-                                            .get_unchecked(slot.row as usize)
-                                    };
-                                    if ev.ingest_ts < prev.ingest_ts {
-                                        unsafe {
-                                            let s_mut = slots.get_unchecked_mut(idx);
-                                            s_mut.shard = t as u32;
-                                            s_mut.row = r_idx as u32;
-                                        }
-                                    }
-                                    break;
-                                }
-                                idx = (idx + 1) & mask;
+                    if total_rows <= 4096 {
+                        flat_raw.clear();
+                        flat_ing.clear();
+                        flat_raw.reserve(total_rows);
+                        flat_ing.reserve(total_rows);
+                        for t in 0..scan_threads {
+                            let idx = t * EVENT_BUCKETS + b;
+                            flat_raw.extend_from_slice(&raw_shards[idx]);
+                            flat_ing.extend_from_slice(&ingest_shards[idx]);
+                        }
+                        dedup_slice_into_buckets(
+                            &flat_raw,
+                            &flat_ing,
+                            &mut slots,
+                            &mut occupied,
+                            link_map,
+                            &mut user_buckets,
+                            &mut pending,
+                            timing,
+                            &mut hash_cpu_ns,
+                            &mut scatter_cpu_ns,
+                            &mut unique_valid,
+                        );
+                    } else {
+                        let h_t0 = if timing { Some(Instant::now()) } else { None };
+                        let mut counts = [0usize; SUB_PARTITIONS];
+                        for t in 0..scan_threads {
+                            for ev in &raw_shards[t * EVENT_BUCKETS + b] {
+                                let sp = ((mix64(ev.event_id) >> 8) as usize) & (SUB_PARTITIONS - 1);
+                                counts[sp] += 1;
                             }
                         }
-                    }
-                    if let Some(t) = h_t0 {
-                        hash_cpu_ns += t.elapsed().as_nanos() as u64;
-                    }
-
-                    let s_t0 = if timing { Some(Instant::now()) } else { None };
-                    for &slot_idx in &occupied {
-                        let slot = unsafe { *slots.get_unchecked(slot_idx as usize) };
-                        let ev = unsafe {
-                            raw_shards
-                                .get_unchecked(slot.shard as usize * EVENT_BUCKETS + b)
-                                .get_unchecked(slot.row as usize)
-                        };
-                        if ev.price_and_cat != INVALID_MARKER {
-                            let canonical_user = link_map.resolve(ev.user_id);
-                            let ub = (mix64(canonical_user) as usize) & (USER_BUCKETS - 1);
-                            unsafe {
-                                user_buckets.get_unchecked_mut(ub).push(CleanEvent {
-                                    canonical_user,
-                                    rel_ts: ev.rel_ts,
-                                    price_and_cat: ev.price_and_cat,
-                                });
-                            }
-                            if timing {
-                                unique_valid += 1;
-                            }
+                        let mut offsets = [0usize; SUB_PARTITIONS + 1];
+                        let mut sum = 0usize;
+                        for i in 0..SUB_PARTITIONS {
+                            offsets[i] = sum;
+                            sum += counts[i];
                         }
+                        offsets[SUB_PARTITIONS] = sum;
+
+                        sub_raw.clear();
+                        sub_raw.reserve(total_rows);
+                        sub_ing.clear();
+                        sub_ing.reserve(total_rows);
                         unsafe {
-                            slots.get_unchecked_mut(slot_idx as usize).key = EMPTY_ID;
+                            sub_raw.set_len(total_rows);
+                            sub_ing.set_len(total_rows);
                         }
-                    }
-                    if let Some(t) = s_t0 {
-                        scatter_cpu_ns += t.elapsed().as_nanos() as u64;
+                        let mut cursors = [0usize; SUB_PARTITIONS];
+                        cursors.copy_from_slice(&offsets[..SUB_PARTITIONS]);
+
+                        for t in 0..scan_threads {
+                            let idx = t * EVENT_BUCKETS + b;
+                            let r_slice = &raw_shards[idx];
+                            let i_slice = &ingest_shards[idx];
+                            for j in 0..r_slice.len() {
+                                let ev = unsafe { *r_slice.get_unchecked(j) };
+                                let ing = unsafe { *i_slice.get_unchecked(j) };
+                                let sp = ((mix64(ev.event_id) >> 8) as usize) & (SUB_PARTITIONS - 1);
+                                let pos = cursors[sp];
+                                cursors[sp] = pos + 1;
+                                unsafe {
+                                    *sub_raw.get_unchecked_mut(pos) = ev;
+                                    *sub_ing.get_unchecked_mut(pos) = ing;
+                                }
+                            }
+                        }
+                        if let Some(t) = h_t0 {
+                            hash_cpu_ns += t.elapsed().as_nanos() as u64;
+                        }
+
+                        for sp in 0..SUB_PARTITIONS {
+                            let st = offsets[sp];
+                            let en = offsets[sp + 1];
+                            if st < en {
+                                dedup_slice_into_buckets(
+                                    &sub_raw[st..en],
+                                    &sub_ing[st..en],
+                                    &mut slots,
+                                    &mut occupied,
+                                    link_map,
+                                    &mut user_buckets,
+                                    &mut pending,
+                                    timing,
+                                    &mut hash_cpu_ns,
+                                    &mut scatter_cpu_ns,
+                                    &mut unique_valid,
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -184,6 +320,7 @@ pub fn dedup_events(
     });
 
     drop(raw_shards);
+    drop(ingest_shards);
 
     let mut event_shards = Vec::with_capacity(num_threads * USER_BUCKETS);
     let mut h_sum = 0u64;

@@ -37,6 +37,19 @@ impl LinkMap {
     }
 
     #[inline(always)]
+    pub fn prefetch(&self, user_id: u64) {
+        if self.slots.is_empty() || user_id == EMPTY_ID {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let idx = (mix64(user_id) as usize) & self.mask;
+            let ptr = self.slots.as_ptr().add(idx) as *const i8;
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+        }
+    }
+
+    #[inline(always)]
     pub fn resolve(&self, user_id: u64) -> u64 {
         if self.slots.is_empty() || user_id == EMPTY_ID {
             return user_id;
