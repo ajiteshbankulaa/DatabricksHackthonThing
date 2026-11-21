@@ -1,0 +1,9 @@
+fixtures/
+dev-answer/
+dev/
+out/
+scratch/
+target/
+generator/target/
+.git/
+*.md
