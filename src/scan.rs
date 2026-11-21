@@ -46,7 +46,93 @@ struct ScanTask {
     end: u64,
 }
 
+#[cfg(target_os = "linux")]
+struct MmapFile {
+    ptr: *const u8,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for MmapFile {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for MmapFile {}
+
+#[cfg(target_os = "linux")]
+impl MmapFile {
+    fn from_file(file: &File, len: u64) -> io::Result<Self> {
+        if len == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null(),
+                len: 0,
+            });
+        }
+        use std::os::unix::io::AsRawFd;
+        unsafe extern "C" {
+            fn mmap(
+                addr: *mut core::ffi::c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut core::ffi::c_void;
+            fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const PROT_READ: i32 = 1;
+        const MAP_PRIVATE: i32 = 2;
+        const MADV_SEQUENTIAL: i32 = 2;
+        const MAP_FAILED: *mut core::ffi::c_void = !0usize as *mut core::ffi::c_void;
+        let size = len as usize;
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                size,
+                PROT_READ,
+                MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe {
+            madvise(ptr, size, MADV_SEQUENTIAL);
+        }
+        Ok(Self {
+            ptr: ptr as *const u8,
+            len: size,
+        })
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MmapFile {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            unsafe extern "C" {
+                fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
+            }
+            unsafe {
+                munmap(self.ptr as *mut core::ffi::c_void, self.len);
+            }
+        }
+    }
+}
+
 enum FileBank {
+    #[cfg(target_os = "linux")]
+    Mmap(Vec<MmapFile>),
+    #[cfg(not(target_os = "linux"))]
     Open(Vec<File>),
     Paths(Vec<PathBuf>),
 }
@@ -55,24 +141,27 @@ impl FileBank {
     fn open_for_paths(paths: Vec<PathBuf>) -> io::Result<(Self, Vec<u64>)> {
         let mut lens = Vec::with_capacity(paths.len());
         if paths.len() <= 384 {
-            let mut files = Vec::with_capacity(paths.len());
-            for p in paths {
-                let f = File::open(&p)?;
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::unix::io::AsRawFd;
-                    unsafe extern "C" {
-                        fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
-                    }
-                    const POSIX_FADV_SEQUENTIAL: i32 = 2;
-                    unsafe {
-                        posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_SEQUENTIAL);
-                    }
+            #[cfg(target_os = "linux")]
+            {
+                let mut mmaps = Vec::with_capacity(paths.len());
+                for p in paths {
+                    let f = File::open(&p)?;
+                    let flen = f.metadata()?.len();
+                    mmaps.push(MmapFile::from_file(&f, flen)?);
+                    lens.push(flen);
                 }
-                lens.push(f.metadata()?.len());
-                files.push(f);
+                Ok((Self::Mmap(mmaps), lens))
             }
-            Ok((Self::Open(files), lens))
+            #[cfg(not(target_os = "linux"))]
+            {
+                let mut files = Vec::with_capacity(paths.len());
+                for p in paths {
+                    let f = File::open(&p)?;
+                    lens.push(f.metadata()?.len());
+                    files.push(f);
+                }
+                Ok((Self::Open(files), lens))
+            }
         } else {
             for p in &paths {
                 lens.push(std::fs::metadata(p)?.len());
@@ -81,8 +170,39 @@ impl FileBank {
         }
     }
 
+    #[inline(always)]
+    fn is_mmap(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self, Self::Mmap(_))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    #[inline(always)]
+    fn mmap_slice(&self, file_idx: usize) -> Option<&[u8]> {
+        #[cfg(target_os = "linux")]
+        if let Self::Mmap(mmaps) = self {
+            return Some(mmaps[file_idx].as_slice());
+        }
+        let _ = file_idx;
+        None
+    }
+
     fn read_chunk(&self, file_idx: usize, start: u64, buf: &mut [u8]) -> io::Result<usize> {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::Mmap(mmaps) => {
+                let sl = mmaps[file_idx].as_slice();
+                let s = (start as usize).min(sl.len());
+                let n = buf.len().min(sl.len() - s);
+                buf[..n].copy_from_slice(&sl[s..s + n]);
+                Ok(n)
+            }
+            #[cfg(not(target_os = "linux"))]
             Self::Open(files) => read_exact_at(&files[file_idx], start, buf),
             Self::Paths(paths) => {
                 let f = File::open(&paths[file_idx])?;
@@ -93,6 +213,15 @@ impl FileBank {
 
     fn find_header_end(&self, file_idx: usize, file_len: u64) -> io::Result<u64> {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::Mmap(mmaps) => {
+                let sl = mmaps[file_idx].as_slice();
+                Ok(match sl.iter().position(|&b| b == b'\n') {
+                    Some(i) => i as u64 + 1,
+                    None => file_len,
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
             Self::Open(files) => find_header_end(&files[file_idx], file_len),
             Self::Paths(paths) => {
                 let f = File::open(&paths[file_idx])?;
@@ -105,6 +234,16 @@ impl FileBank {
         let mut tmp = [0u8; 4096];
         let opened;
         let f_ref = match self {
+            #[cfg(target_os = "linux")]
+            Self::Mmap(mmaps) => {
+                let sl = mmaps[file_idx].as_slice();
+                let s = (pos as usize).min(sl.len());
+                return Ok(match sl[s..].iter().position(|&b| b == b'\n') {
+                    Some(i) => (s + i + 1) as u64,
+                    None => file_len,
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
             Self::Open(files) => &files[file_idx],
             Self::Paths(paths) => {
                 opened = File::open(&paths[file_idx])?;
@@ -126,12 +265,70 @@ impl FileBank {
     }
 }
 
+#[inline]
+fn snap_mmap_range(data: &[u8], task_start: u64, task_end: u64) -> Option<(usize, usize)> {
+    let file_len = data.len();
+    let s = task_start as usize;
+    let e = (task_end as usize).min(file_len);
+    if s >= e || file_len == 0 {
+        return None;
+    }
+
+    let actual_start = if s == 0 {
+        let hdr_nl = data[..e].iter().position(|&b| b == b'\n')?;
+        let st = hdr_nl + 1;
+        if st >= e {
+            return None;
+        }
+        st
+    } else {
+        let search_end = e - 1;
+        let rel_nl = data[s - 1..search_end].iter().position(|&b| b == b'\n')?;
+        (s - 1) + rel_nl + 1
+    };
+
+    let actual_end = if e >= file_len {
+        file_len
+    } else {
+        match data[e - 1..].iter().position(|&b| b == b'\n') {
+            Some(rel_nl) => (e - 1) + rel_nl + 1,
+            None => file_len,
+        }
+    };
+
+    if actual_start >= actual_end {
+        None
+    } else {
+        Some((actual_start, actual_end))
+    }
+}
+
 fn append_tasks(
     bank: &FileBank,
     lens: &[u64],
     kind: TaskKind,
     tasks: &mut Vec<ScanTask>,
 ) -> io::Result<()> {
+    if bank.is_mmap() {
+        for (file_idx, &file_len) in lens.iter().enumerate() {
+            if file_len == 0 {
+                continue;
+            }
+            let mut start = 0u64;
+            while start < file_len {
+                let end = start.saturating_add(SCAN_CHUNK_SIZE).min(file_len);
+                tasks.push(ScanTask {
+                    kind,
+                    file_idx,
+                    start,
+                    end,
+                });
+                start = end;
+            }
+        }
+        return Ok(());
+    }
+
     for (file_idx, &file_len) in lens.iter().enumerate() {
         let data_start = bank.find_header_end(file_idx, file_len)?;
         if data_start >= file_len {
@@ -282,19 +479,27 @@ pub fn scan_events_and_clicks(
                             continue;
                         }
                         let c_t0 = if timing { Some(Instant::now()) } else { None };
-                        if buf.len() < len + 64 {
-                            buf.resize(len + 64, 0);
-                        }
                         let bank = match task.kind {
                             TaskKind::Event => &event_bank,
                             TaskKind::Click => &click_bank,
                         };
-                        let n = bank.read_chunk(task.file_idx, task.start, &mut buf[..len])?;
-                        buf[n..n + 64].fill(0);
+                        let chunk_slice: &[u8] = if let Some(mm) = bank.mmap_slice(task.file_idx) {
+                            let Some((st, en)) = snap_mmap_range(mm, task.start, task.end) else {
+                                continue;
+                            };
+                            &mm[st..en]
+                        } else {
+                            if buf.len() < len {
+                                buf.resize(len, 0);
+                            }
+                            let n = bank.read_chunk(task.file_idx, task.start, &mut buf[..len])?;
+                            &buf[..n]
+                        };
+                        let n = chunk_slice.len();
 
                         match task.kind {
                             TaskKind::Event => {
-                                scan_csv_chunk::<7, _>(&buf, n, |f| {
+                                scan_csv_chunk::<7, _>(chunk_slice, n, |f| {
                                     if f[0].is_empty() {
                                         return;
                                     }
@@ -302,7 +507,9 @@ pub fn scan_events_and_clicks(
                                         return;
                                     };
                                     let event_id = pack_id(f[0]);
-                                    let mut valid = !f[1].is_empty();
+                                    let mut valid = !f[1].is_empty()
+                                        && !f[5].is_empty()
+                                        && matches!(f[4], b"view" | b"cart" | b"purchase");
                                     let mut rel_ts = 0u32;
                                     if valid {
                                         if let Some(ts) = parse_ts_fast(f[2], &lookups.date_table) {
@@ -319,23 +526,12 @@ pub fn scan_events_and_clicks(
                                         }
                                     }
                                     let mut price_and_cat = NON_PURCHASE_CAT as u32;
-                                    if valid {
-                                        if f[5].is_empty() {
-                                            valid = false;
+                                    if valid && f[4] == b"purchase" {
+                                        if let Some(price) = parse_price_cents(f[6]) {
+                                            let cat = lookups.lookup_product(f[5]);
+                                            price_and_cat = (price << 8) | (cat as u32);
                                         } else {
-                                            match f[4] {
-                                                b"view" | b"cart" => {}
-                                                b"purchase" => {
-                                                    if let Some(price) = parse_price_cents(f[6]) {
-                                                        let cat = lookups.lookup_product(f[5]);
-                                                        price_and_cat =
-                                                            (price << 8) | (cat as u32);
-                                                    } else {
-                                                        valid = false;
-                                                    }
-                                                }
-                                                _ => valid = false,
-                                            }
+                                            valid = false;
                                         }
                                     }
                                     let ingest_sec = (ingest_ts.div_euclid(1000)
@@ -367,18 +563,18 @@ pub fn scan_events_and_clicks(
                                 }
                             }
                             TaskKind::Click => {
-                                scan_csv_chunk::<4, _>(&buf, n, |f| {
-                                    if f[0].is_empty() || f[1].is_empty() {
-                                        return;
-                                    }
-                                    let campaign_idx = lookups.lookup_campaign(f[2]);
-                                    if campaign_idx == 0 {
+                                scan_csv_chunk::<4, _>(chunk_slice, n, |f| {
+                                    if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
                                         return;
                                     }
                                     let Some(ts) = parse_ts_fast(f[3], &lookups.date_table) else {
                                         return;
                                     };
                                     if ts < lookups.click_start || ts >= lookups.click_end {
+                                        return;
+                                    }
+                                    let campaign_idx = lookups.lookup_campaign(f[2]);
+                                    if campaign_idx == 0 {
                                         return;
                                     }
                                     let click_id = pack_id(f[0]);
@@ -451,4 +647,66 @@ pub fn scan_events_and_clicks(
             valid_clicks,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pre_snapped_ranges(data: &[u8], chunk_size: usize) -> Vec<(usize, usize)> {
+        let Some(hdr_nl) = data.iter().position(|&b| b == b'\n') else {
+            return Vec::new();
+        };
+        let data_start = hdr_nl + 1;
+        if data_start >= data.len() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut s = data_start;
+        while s < data.len() {
+            let target = (s + chunk_size).min(data.len());
+            let end = if target >= data.len() {
+                data.len()
+            } else {
+                match data[target..].iter().position(|&b| b == b'\n') {
+                    Some(i) => target + i + 1,
+                    None => data.len(),
+                }
+            };
+            out.push((s, end));
+            s = end;
+        }
+        out
+    }
+
+    #[test]
+    fn test_worker_snapped_chunk_parity() {
+        let cases: &[&[u8]] = &[
+            b"h1,h2\nr1,a\nr2,bb\nr3,ccc\n\nr4,dddd\nr5,no_nl",
+            b"only_header\n",
+            b"no_newline_at_all",
+            b"a,b\nshort\nvery_long_line_spanning_many_small_chunks_0123456789ABCDEF\nx,y\n",
+            b"very_long_header_0123456789ABCDEF0123456789ABCDEF\nrow1,1\nrow2,2\n",
+        ];
+
+        for data in cases {
+            let exp_bytes: Vec<u8> = pre_snapped_ranges(data, 7)
+                .into_iter()
+                .flat_map(|(s, e)| data[s..e].iter().copied())
+                .collect();
+
+            for &chunk_size in &[1usize, 2, 3, 7, 13, 64, 4096] {
+                let mut got = Vec::new();
+                let mut start = 0usize;
+                while start < data.len() {
+                    let end = (start + chunk_size).min(data.len());
+                    if let Some((st, en)) = snap_mmap_range(data, start as u64, end as u64) {
+                        got.extend_from_slice(&data[st..en]);
+                    }
+                    start = end;
+                }
+                assert_eq!(got, exp_bytes, "mismatch for chunk_size={chunk_size}");
+            }
+        }
+    }
 }

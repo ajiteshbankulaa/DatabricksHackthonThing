@@ -20,9 +20,20 @@ RUN cargo build --release --manifest-path generator/Cargo.toml && \
     "$LLVM_PROFDATA" merge -o /tmp/pgo/merged.profdata /tmp/pgo/*.profraw && \
     rm -f /tmp/pgo/*.profraw
 
-# 2. Recompile final binary with merged PGO + native target tuning
-RUN RUSTFLAGS="-C target-cpu=native -C profile-use=/tmp/pgo/merged.profdata -C llvm-args=-pgo-warn-missing-function" cargo build --release && \
-    rm -rf /tmp/pgo
+# 2. Recompile with merged PGO + native target tuning, then apply guarded instrumented LLVM BOLT
+RUN RUSTFLAGS="-C target-cpu=native -C profile-use=/tmp/pgo/merged.profdata -C llvm-args=-pgo-warn-missing-function -C link-arg=-Wl,--emit-relocs" cargo build --release && \
+    rm -rf /tmp/pgo && \
+    LLVM_BOLT="$(find "$(rustc --print sysroot)" /usr -name llvm-bolt -type f 2>/dev/null | head -n 1)" && \
+    if [ -n "$LLVM_BOLT" ]; then \
+        ./generator/target/release/generate --seed 42 --events 2000000 --clicks 500000 --output /tmp/bolt_data && \
+        "$LLVM_BOLT" /build/target/release/shopping-sessions -instrument -instrumentation-file=/tmp/prof.fdata -o /build/target/release/shopping-sessions.inst && \
+        PGO_TRAIN=1 NCPU=8 /build/target/release/shopping-sessions.inst /tmp/bolt_data /tmp/bolt_out && \
+        "$LLVM_BOLT" /build/target/release/shopping-sessions -o /build/target/release/shopping-sessions.bolt -data=/tmp/prof.fdata \
+            -reorder-blocks=ext-tsp -reorder-functions=hfsort -split-functions -split-all-cold && \
+        mv /build/target/release/shopping-sessions.bolt /build/target/release/shopping-sessions || true; \
+        rm -rf /tmp/bolt_data /tmp/bolt_out /tmp/prof.fdata /build/target/release/shopping-sessions.inst /build/target/release/shopping-sessions.bolt; \
+    fi && \
+    strip /build/target/release/shopping-sessions
 
 FROM debian:bookworm-slim
 

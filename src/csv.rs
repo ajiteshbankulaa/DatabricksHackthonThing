@@ -165,14 +165,14 @@ fn dispatch_row<const N: usize, F>(
     on_row(fields);
 }
 
-/// Scans `buf[..len]` (`buf.len() >= len + 64` for safe SIMD over-read).
+/// Scans `buf[..len]` safely without reading past `buf[..len]`.
 /// Splits strictly on `\n` and `,`, enforcing `N` fields and valid quoting.
 #[inline(always)]
 pub fn scan_csv_chunk<const N: usize, F>(buf: &[u8], len: usize, mut on_row: F)
 where
     F: FnMut([&[u8]; N]),
 {
-    debug_assert!(buf.len() >= len + 64);
+    debug_assert!(buf.len() >= len);
     debug_assert!(N <= 8);
     if len == 0 {
         return;
@@ -220,6 +220,29 @@ fn process_block_masks<const N: usize, F>(
     F: FnMut([&[u8]; N]),
 {
     let mut delim_mask = nl_mask | comma_mask;
+    if quote_mask == 0 && !*cur_field_quoted {
+        while delim_mask != 0 {
+            let bit = delim_mask.trailing_zeros() as usize;
+            let pos = offset + bit;
+            if ((nl_mask >> bit) & 1) != 0 {
+                if *field_idx == N - 1 {
+                    field_ends[N - 1] = pos;
+                    dispatch_row::<N, F>(buf, *line_start, field_ends, *field_quote_bits, on_row);
+                }
+                *line_start = pos + 1;
+                *field_idx = 0;
+                *field_quote_bits = 0;
+            } else {
+                if *field_idx < N {
+                    field_ends[*field_idx] = pos;
+                }
+                *field_idx += 1;
+            }
+            delim_mask &= delim_mask - 1;
+        }
+        return;
+    }
+
     let mut prev_bit = 0usize;
     while delim_mask != 0 {
         let bit = delim_mask.trailing_zeros() as usize;
@@ -280,8 +303,8 @@ where
     let mut cur_field_quoted = false;
 
     let mut offset = 0usize;
-    while offset < len {
-        let (mut nl_mask, mut comma_mask, mut quote_mask) = unsafe {
+    while offset + 64 <= len {
+        let (nl_mask, comma_mask, quote_mask) = unsafe {
             let c0 = _mm256_loadu_si256(ptr.add(offset) as *const __m256i);
             let c1 = _mm256_loadu_si256(ptr.add(offset + 32) as *const __m256i);
 
@@ -296,14 +319,6 @@ where
 
             (nl0 | (nl1 << 32), cm0 | (cm1 << 32), qt0 | (qt1 << 32))
         };
-
-        let rem = len - offset;
-        if rem < 64 {
-            let valid = (1u64 << rem) - 1;
-            nl_mask &= valid;
-            comma_mask &= valid;
-            quote_mask &= valid;
-        }
 
         process_block_masks::<N, F>(
             buf,
@@ -320,6 +335,48 @@ where
         );
 
         offset += 64;
+    }
+
+    if offset < len {
+        let rem = len - offset;
+        let mut tail = [0u8; 64];
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr.add(offset), tail.as_mut_ptr(), rem);
+        }
+        let valid = (1u64 << rem) - 1;
+        let tptr = tail.as_ptr();
+        let (nl_mask, comma_mask, quote_mask) = unsafe {
+            let c0 = _mm256_loadu_si256(tptr as *const __m256i);
+            let c1 = _mm256_loadu_si256(tptr.add(32) as *const __m256i);
+
+            let nl0 = _mm256_cmpeq_epi8_mask(c0, v_nl) as u64;
+            let nl1 = _mm256_cmpeq_epi8_mask(c1, v_nl) as u64;
+
+            let cm0 = _mm256_cmpeq_epi8_mask(c0, v_comma) as u64;
+            let cm1 = _mm256_cmpeq_epi8_mask(c1, v_comma) as u64;
+
+            let qt0 = _mm256_cmpeq_epi8_mask(c0, v_quote) as u64;
+            let qt1 = _mm256_cmpeq_epi8_mask(c1, v_quote) as u64;
+
+            (
+                (nl0 | (nl1 << 32)) & valid,
+                (cm0 | (cm1 << 32)) & valid,
+                (qt0 | (qt1 << 32)) & valid,
+            )
+        };
+        process_block_masks::<N, F>(
+            buf,
+            offset,
+            nl_mask,
+            comma_mask,
+            quote_mask,
+            &mut line_start,
+            &mut field_idx,
+            &mut field_ends,
+            &mut field_quote_bits,
+            &mut cur_field_quoted,
+            on_row,
+        );
     }
 
     if line_start < len && field_idx == N - 1 {
@@ -351,8 +408,8 @@ where
     let mut cur_field_quoted = false;
 
     let mut offset = 0usize;
-    while offset < len {
-        let (mut nl_mask, mut comma_mask, mut quote_mask) = unsafe {
+    while offset + 64 <= len {
+        let (nl_mask, comma_mask, quote_mask) = unsafe {
             let chunk = _mm512_loadu_si512(ptr.add(offset) as *const __m512i);
             (
                 _mm512_cmpeq_epi8_mask(chunk, v_nl),
@@ -360,14 +417,6 @@ where
                 _mm512_cmpeq_epi8_mask(chunk, v_quote),
             )
         };
-
-        let rem = len - offset;
-        if rem < 64 {
-            let valid = (1u64 << rem) - 1;
-            nl_mask &= valid;
-            comma_mask &= valid;
-            quote_mask &= valid;
-        }
 
         process_block_masks::<N, F>(
             buf,
@@ -384,6 +433,36 @@ where
         );
 
         offset += 64;
+    }
+
+    if offset < len {
+        let rem = len - offset;
+        let mut tail = [0u8; 64];
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr.add(offset), tail.as_mut_ptr(), rem);
+        }
+        let valid = (1u64 << rem) - 1;
+        let (nl_mask, comma_mask, quote_mask) = unsafe {
+            let chunk = _mm512_loadu_si512(tail.as_ptr() as *const __m512i);
+            (
+                _mm512_cmpeq_epi8_mask(chunk, v_nl) & valid,
+                _mm512_cmpeq_epi8_mask(chunk, v_comma) & valid,
+                _mm512_cmpeq_epi8_mask(chunk, v_quote) & valid,
+            )
+        };
+        process_block_masks::<N, F>(
+            buf,
+            offset,
+            nl_mask,
+            comma_mask,
+            quote_mask,
+            &mut line_start,
+            &mut field_idx,
+            &mut field_ends,
+            &mut field_quote_bits,
+            &mut cur_field_quoted,
+            on_row,
+        );
     }
 
     if line_start < len && field_idx == N - 1 {
@@ -415,8 +494,8 @@ where
     let mut cur_field_quoted = false;
 
     let mut offset = 0usize;
-    while offset < len {
-        let (mut nl_mask, mut comma_mask, mut quote_mask) = unsafe {
+    while offset + 64 <= len {
+        let (nl_mask, comma_mask, quote_mask) = unsafe {
             let c0 = _mm256_loadu_si256(ptr.add(offset) as *const __m256i);
             let c1 = _mm256_loadu_si256(ptr.add(offset + 32) as *const __m256i);
 
@@ -431,14 +510,6 @@ where
 
             (nl0 | (nl1 << 32), cm0 | (cm1 << 32), qt0 | (qt1 << 32))
         };
-
-        let rem = len - offset;
-        if rem < 64 {
-            let valid = (1u64 << rem) - 1;
-            nl_mask &= valid;
-            comma_mask &= valid;
-            quote_mask &= valid;
-        }
 
         process_block_masks::<N, F>(
             buf,
@@ -457,6 +528,48 @@ where
         offset += 64;
     }
 
+    if offset < len {
+        let rem = len - offset;
+        let mut tail = [0u8; 64];
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr.add(offset), tail.as_mut_ptr(), rem);
+        }
+        let valid = (1u64 << rem) - 1;
+        let tptr = tail.as_ptr();
+        let (nl_mask, comma_mask, quote_mask) = unsafe {
+            let c0 = _mm256_loadu_si256(tptr as *const __m256i);
+            let c1 = _mm256_loadu_si256(tptr.add(32) as *const __m256i);
+
+            let nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, v_nl)) as u32 as u64;
+            let nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, v_nl)) as u32 as u64;
+
+            let cm0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, v_comma)) as u32 as u64;
+            let cm1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, v_comma)) as u32 as u64;
+
+            let qt0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, v_quote)) as u32 as u64;
+            let qt1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, v_quote)) as u32 as u64;
+
+            (
+                (nl0 | (nl1 << 32)) & valid,
+                (cm0 | (cm1 << 32)) & valid,
+                (qt0 | (qt1 << 32)) & valid,
+            )
+        };
+        process_block_masks::<N, F>(
+            buf,
+            offset,
+            nl_mask,
+            comma_mask,
+            quote_mask,
+            &mut line_start,
+            &mut field_idx,
+            &mut field_ends,
+            &mut field_quote_bits,
+            &mut cur_field_quoted,
+            on_row,
+        );
+    }
+
     if line_start < len && field_idx == N - 1 {
         field_ends[N - 1] = len;
         if cur_field_quoted {
@@ -470,6 +583,86 @@ where
 fn has_eq_mask(word: u64, byte_splat: u64) -> u64 {
     let x = word ^ byte_splat;
     (x.wrapping_sub(0x0101_0101_0101_0101)) & !x & 0x8080_8080_8080_8080
+}
+
+#[inline(always)]
+fn process_swar_word<const N: usize, F>(
+    buf: &[u8],
+    offset: usize,
+    nl_mask: u64,
+    comma_mask: u64,
+    quote_mask: u64,
+    line_start: &mut usize,
+    field_idx: &mut usize,
+    field_ends: &mut [usize; N],
+    field_quote_bits: &mut u8,
+    cur_field_quoted: &mut bool,
+    on_row: &mut F,
+) where
+    F: FnMut([&[u8]; N]),
+{
+    let mut delim_mask = nl_mask | comma_mask;
+    if quote_mask == 0 && !*cur_field_quoted {
+        while delim_mask != 0 {
+            let bit_msb = delim_mask.trailing_zeros() as usize;
+            let pos = offset + (bit_msb >> 3);
+            if ((nl_mask >> bit_msb) & 1) != 0 {
+                if *field_idx == N - 1 {
+                    field_ends[N - 1] = pos;
+                    dispatch_row::<N, F>(buf, *line_start, field_ends, *field_quote_bits, on_row);
+                }
+                *line_start = pos + 1;
+                *field_idx = 0;
+                *field_quote_bits = 0;
+            } else {
+                if *field_idx < N {
+                    field_ends[*field_idx] = pos;
+                }
+                *field_idx += 1;
+            }
+            delim_mask &= delim_mask - 1;
+        }
+        return;
+    }
+
+    let mut prev_bit = 0usize;
+    while delim_mask != 0 {
+        let bit_msb = delim_mask.trailing_zeros() as usize;
+        let pos = offset + (bit_msb >> 3);
+        if quote_mask != 0 {
+            let span_mask = ((1u64 << (bit_msb - prev_bit)) - 1) << prev_bit;
+            if (quote_mask & span_mask) != 0 {
+                *cur_field_quoted = true;
+            }
+        }
+        if ((nl_mask >> bit_msb) & 1) != 0 {
+            if *field_idx == N - 1 {
+                field_ends[N - 1] = pos;
+                if *cur_field_quoted {
+                    *field_quote_bits |= 1u8 << (N - 1);
+                }
+                dispatch_row::<N, F>(buf, *line_start, field_ends, *field_quote_bits, on_row);
+            }
+            *line_start = pos + 1;
+            *field_idx = 0;
+            *field_quote_bits = 0;
+            *cur_field_quoted = false;
+        } else {
+            if *field_idx < N {
+                field_ends[*field_idx] = pos;
+                if *cur_field_quoted {
+                    *field_quote_bits |= 1u8 << *field_idx;
+                }
+            }
+            *field_idx += 1;
+            *cur_field_quoted = false;
+        }
+        prev_bit = bit_msb + 1;
+        delim_mask &= delim_mask - 1;
+    }
+    if quote_mask != 0 && prev_bit < 64 && (quote_mask >> prev_bit) != 0 {
+        *cur_field_quoted = true;
+    }
 }
 
 fn scan_csv_swar<const N: usize, F>(buf: &[u8], len: usize, on_row: &mut F)
@@ -487,62 +680,49 @@ where
     let mut cur_field_quoted = false;
 
     let mut offset = 0usize;
-    while offset < len {
+    while offset + 8 <= len {
         let word = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
-        let mut nl_mask = has_eq_mask(word, SPLAT_NL);
-        let mut comma_mask = has_eq_mask(word, SPLAT_COMMA);
-        let mut quote_mask = has_eq_mask(word, SPLAT_QUOTE);
-
-        let rem = len - offset;
-        if rem < 8 {
-            let valid = (1u64 << (rem * 8)) - 1;
-            nl_mask &= valid;
-            comma_mask &= valid;
-            quote_mask &= valid;
-        }
-
-        let mut delim_mask = nl_mask | comma_mask;
-        let mut prev_bit = 0usize;
-        while delim_mask != 0 {
-            let bit_msb = delim_mask.trailing_zeros() as usize;
-            let byte_idx = bit_msb >> 3;
-            let pos = offset + byte_idx;
-            if quote_mask != 0 {
-                let span_mask = ((1u64 << (bit_msb - prev_bit)) - 1) << prev_bit;
-                if (quote_mask & span_mask) != 0 {
-                    cur_field_quoted = true;
-                }
-            }
-            if ((nl_mask >> bit_msb) & 1) != 0 {
-                if field_idx == N - 1 {
-                    field_ends[N - 1] = pos;
-                    if cur_field_quoted {
-                        field_quote_bits |= 1u8 << (N - 1);
-                    }
-                    dispatch_row::<N, F>(buf, line_start, &field_ends, field_quote_bits, on_row);
-                }
-                line_start = pos + 1;
-                field_idx = 0;
-                field_quote_bits = 0;
-                cur_field_quoted = false;
-            } else {
-                if field_idx < N {
-                    field_ends[field_idx] = pos;
-                    if cur_field_quoted {
-                        field_quote_bits |= 1u8 << field_idx;
-                    }
-                }
-                field_idx += 1;
-                cur_field_quoted = false;
-            }
-            prev_bit = bit_msb + 1;
-            delim_mask &= delim_mask - 1;
-        }
-        if quote_mask != 0 && prev_bit < 64 && (quote_mask >> prev_bit) != 0 {
-            cur_field_quoted = true;
-        }
-
+        let nl_mask = has_eq_mask(word, SPLAT_NL);
+        let comma_mask = has_eq_mask(word, SPLAT_COMMA);
+        let quote_mask = has_eq_mask(word, SPLAT_QUOTE);
+        process_swar_word::<N, F>(
+            buf,
+            offset,
+            nl_mask,
+            comma_mask,
+            quote_mask,
+            &mut line_start,
+            &mut field_idx,
+            &mut field_ends,
+            &mut field_quote_bits,
+            &mut cur_field_quoted,
+            on_row,
+        );
         offset += 8;
+    }
+
+    if offset < len {
+        let rem = len - offset;
+        let mut tail = [0u8; 8];
+        tail[..rem].copy_from_slice(&buf[offset..len]);
+        let valid = (1u64 << (rem * 8)) - 1;
+        let word = u64::from_le_bytes(tail);
+        let nl_mask = has_eq_mask(word, SPLAT_NL) & valid;
+        let comma_mask = has_eq_mask(word, SPLAT_COMMA) & valid;
+        let quote_mask = has_eq_mask(word, SPLAT_QUOTE) & valid;
+        process_swar_word::<N, F>(
+            buf,
+            offset,
+            nl_mask,
+            comma_mask,
+            quote_mask,
+            &mut line_start,
+            &mut field_idx,
+            &mut field_ends,
+            &mut field_quote_bits,
+            &mut cur_field_quoted,
+            on_row,
+        );
     }
 
     if line_start < len && field_idx == N - 1 {
@@ -574,7 +754,7 @@ pub fn read_whole_csv<const N: usize, F>(path: &Path, on_row: F) -> io::Result<(
 where
     F: FnMut([&[u8]; N]),
 {
-    let mut data = std::fs::read(path)?;
+    let data = std::fs::read(path)?;
     let first_nl = match data.iter().position(|&b| b == b'\n') {
         Some(pos) => pos + 1,
         None => return Ok(()),
@@ -583,7 +763,6 @@ where
         return Ok(());
     }
     let body_len = data.len() - first_nl;
-    data.resize(data.len() + 64, 0);
     scan_csv_chunk::<N, F>(&data[first_nl..], body_len, on_row);
     Ok(())
 }
@@ -595,15 +774,13 @@ mod tests {
     #[test]
     fn test_csv_dialect_edge_cases() {
         let raw = b"a,b\n\"u1\",u2\nu1,u2,u3\nu1,\"u2\"x\n\n\"\",v\r\n\"very_long_user_identifier_0123456789012345678901234567890123456789\",ok_long\nno_nl_last,ok";
-        let mut padded = raw.to_vec();
-        let len = padded.len();
-        padded.resize(len + 64, 0);
+        let len = raw.len();
         let mut rows_simd = Vec::new();
-        scan_csv_chunk::<2, _>(&padded, len, |f| {
+        scan_csv_chunk::<2, _>(raw, len, |f| {
             rows_simd.push((f[0].to_vec(), f[1].to_vec()));
         });
         let mut rows_swar = Vec::new();
-        scan_csv_swar::<2, _>(&padded, len, &mut |f| {
+        scan_csv_swar::<2, _>(raw, len, &mut |f| {
             rows_swar.push((f[0].to_vec(), f[1].to_vec()));
         });
         let expected = vec![
@@ -618,5 +795,26 @@ mod tests {
         ];
         assert_eq!(rows_simd, expected);
         assert_eq!(rows_swar, expected);
+    }
+
+    #[test]
+    fn test_csv_zero_overread_lengths() {
+        // Test unpadded exact slices across tail lengths <64 and >64 without panicking or dropping final row.
+        for tail_pad in 0..70 {
+            let mut s = String::from("a,b\n\"q\",w\n");
+            s.push_str(&"x".repeat(tail_pad));
+            s.push_str(",end");
+            let bytes = s.as_bytes();
+            let mut simd = Vec::new();
+            scan_csv_chunk::<2, _>(bytes, bytes.len(), |f| {
+                simd.push((f[0].to_vec(), f[1].to_vec()));
+            });
+            let mut swar = Vec::new();
+            scan_csv_swar::<2, _>(bytes, bytes.len(), &mut |f| {
+                swar.push((f[0].to_vec(), f[1].to_vec()));
+            });
+            assert_eq!(simd, swar, "mismatch at tail_pad={tail_pad}");
+            assert_eq!(simd.len(), 3);
+        }
     }
 }
