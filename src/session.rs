@@ -2,12 +2,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::dedup::CleanEvent;
-use crate::id::cmp_id;
+use crate::id::{cmp_id, mix64};
 use crate::lookup::{Lookups, NON_PURCHASE_CAT};
 use crate::scan::{CleanClick, USER_BUCKETS};
 use crate::timestamp::{DAY_MS, SEVEN_DAYS_MS};
 
 const SESSION_GAP_MS: u32 = 1_800_000;
+const MICRO_BUCKETS: usize = 256;
 
 #[derive(Default, Clone, Copy)]
 pub struct SessionStats {
@@ -70,6 +71,281 @@ pub struct SessionOutput {
     pub stats: SessionStats,
 }
 
+struct WhaleAssistState {
+    counts: Vec<u32>,
+    pos: Vec<u16>,
+    active: Vec<u16>,
+}
+
+impl WhaleAssistState {
+    fn new(num_campaigns: usize) -> Self {
+        Self {
+            counts: vec![0u32; num_campaigns],
+            pos: vec![0u16; num_campaigns],
+            active: Vec::with_capacity(256),
+        }
+    }
+
+    #[inline(always)]
+    fn add(&mut self, c: usize) {
+        unsafe {
+            let cnt = self.counts.get_unchecked_mut(c);
+            if *cnt == 0 {
+                *self.pos.get_unchecked_mut(c) = self.active.len() as u16;
+                self.active.push(c as u16);
+            }
+            *cnt += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn remove(&mut self, c: usize) {
+        unsafe {
+            let cnt = self.counts.get_unchecked_mut(c);
+            *cnt -= 1;
+            if *cnt == 0 {
+                let p = *self.pos.get_unchecked(c) as usize;
+                let last_idx = self.active.len() - 1;
+                if p != last_idx {
+                    let swapped = *self.active.get_unchecked(last_idx);
+                    *self.active.get_unchecked_mut(p) = swapped;
+                    *self.pos.get_unchecked_mut(swapped as usize) = p as u16;
+                }
+                self.active.pop();
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        for &c in &self.active {
+            unsafe {
+                *self.counts.get_unchecked_mut(c as usize) = 0;
+            }
+        }
+        self.active.clear();
+    }
+}
+
+#[inline(always)]
+fn micro_bucket(user_id: u64) -> usize {
+    ((mix64(user_id) >> 8) as usize) & (MICRO_BUCKETS - 1)
+}
+
+fn radix_partition_events(
+    src: &[CleanEvent],
+    dst: &mut Vec<CleanEvent>,
+    offsets: &mut [usize; MICRO_BUCKETS + 1],
+) {
+    let mut counts = [0usize; MICRO_BUCKETS];
+    for ev in src {
+        counts[micro_bucket(ev.canonical_user)] += 1;
+    }
+    let mut sum = 0usize;
+    for i in 0..MICRO_BUCKETS {
+        offsets[i] = sum;
+        sum += counts[i];
+    }
+    offsets[MICRO_BUCKETS] = sum;
+
+    dst.clear();
+    dst.reserve(src.len());
+    unsafe {
+        dst.set_len(src.len());
+    }
+    let mut cursors = [0usize; MICRO_BUCKETS];
+    cursors.copy_from_slice(&offsets[..MICRO_BUCKETS]);
+
+    for &ev in src {
+        let b = micro_bucket(ev.canonical_user);
+        let pos = cursors[b];
+        cursors[b] = pos + 1;
+        unsafe {
+            *dst.get_unchecked_mut(pos) = ev;
+        }
+    }
+}
+
+fn radix_partition_clicks(
+    src: &[CleanClick],
+    dst: &mut Vec<CleanClick>,
+    offsets: &mut [usize; MICRO_BUCKETS + 1],
+) {
+    let mut counts = [0usize; MICRO_BUCKETS];
+    for ck in src {
+        counts[micro_bucket(ck.canonical_user)] += 1;
+    }
+    let mut sum = 0usize;
+    for i in 0..MICRO_BUCKETS {
+        offsets[i] = sum;
+        sum += counts[i];
+    }
+    offsets[MICRO_BUCKETS] = sum;
+
+    dst.clear();
+    dst.reserve(src.len());
+    unsafe {
+        dst.set_len(src.len());
+    }
+    let mut cursors = [0usize; MICRO_BUCKETS];
+    cursors.copy_from_slice(&offsets[..MICRO_BUCKETS]);
+
+    for &ck in src {
+        let b = micro_bucket(ck.canonical_user);
+        let pos = cursors[b];
+        cursors[b] = pos + 1;
+        unsafe {
+            *dst.get_unchecked_mut(pos) = ck;
+        }
+    }
+}
+
+#[inline(always)]
+fn insertion_sort_events_by_ts(slice: &mut [CleanEvent]) {
+    for i in 1..slice.len() {
+        let key = slice[i];
+        let mut j = i;
+        while j > 0 && slice[j - 1].rel_ts > key.rel_ts {
+            slice[j] = slice[j - 1];
+            j -= 1;
+        }
+        slice[j] = key;
+    }
+}
+
+fn radix_sort_events_by_ts(slice: &mut [CleanEvent], scratch: &mut Vec<CleanEvent>) {
+    let n = slice.len();
+    scratch.clear();
+    scratch.reserve(n);
+    unsafe {
+        scratch.set_len(n);
+    }
+
+    // 3-pass LSD radix sort on u32 rel_ts: 11 bits + 11 bits + 10 bits.
+    let mut c0 = [0usize; 2048];
+    let mut c1 = [0usize; 2048];
+    let mut c2 = [0usize; 1024];
+    for ev in slice.iter() {
+        let v = ev.rel_ts as usize;
+        c0[v & 0x7FF] += 1;
+        c1[(v >> 11) & 0x7FF] += 1;
+        c2[(v >> 22) & 0x3FF] += 1;
+    }
+
+    let mut s0 = 0usize;
+    let mut s1 = 0usize;
+    for i in 0..2048 {
+        let v0 = c0[i];
+        c0[i] = s0;
+        s0 += v0;
+        let v1 = c1[i];
+        c1[i] = s1;
+        s1 += v1;
+    }
+    let mut s2 = 0usize;
+    for i in 0..1024 {
+        let v2 = c2[i];
+        c2[i] = s2;
+        s2 += v2;
+    }
+
+    // Pass 0: slice -> scratch
+    for &ev in slice.iter() {
+        let b = (ev.rel_ts as usize) & 0x7FF;
+        let pos = c0[b];
+        c0[b] = pos + 1;
+        unsafe {
+            *scratch.get_unchecked_mut(pos) = ev;
+        }
+    }
+    // Pass 1: scratch -> slice
+    for &ev in scratch.iter() {
+        let b = ((ev.rel_ts as usize) >> 11) & 0x7FF;
+        let pos = c1[b];
+        c1[b] = pos + 1;
+        unsafe {
+            *slice.get_unchecked_mut(pos) = ev;
+        }
+    }
+    // Pass 2: slice -> scratch, then copy back if needed (copy_from_slice)
+    for &ev in slice.iter() {
+        let b = ((ev.rel_ts as usize) >> 22) & 0x3FF;
+        let pos = c2[b];
+        c2[b] = pos + 1;
+        unsafe {
+            *scratch.get_unchecked_mut(pos) = ev;
+        }
+    }
+    slice.copy_from_slice(scratch);
+}
+
+#[inline(always)]
+fn sort_user_events_by_ts(u_events: &mut [CleanEvent], rel_scratch: &mut Vec<CleanEvent>) {
+    let len = u_events.len();
+    if len <= 1 {
+        return;
+    }
+    if len <= 64 {
+        insertion_sort_events_by_ts(u_events);
+    } else if len <= 1024 {
+        u_events.sort_unstable_by_key(|e| e.rel_ts);
+    } else {
+        radix_sort_events_by_ts(u_events, rel_scratch);
+    }
+}
+
+#[inline(always)]
+fn cmp_click_in_mb(a: &CleanClick, b: &CleanClick) -> std::cmp::Ordering {
+    a.canonical_user
+        .cmp(&b.canonical_user)
+        .then_with(|| a.rel_ts.cmp(&b.rel_ts))
+        .then_with(|| cmp_id(b.click_id, a.click_id))
+}
+
+#[inline(always)]
+fn insertion_sort_clicks(slice: &mut [CleanClick]) {
+    for i in 1..slice.len() {
+        let key = slice[i];
+        let mut j = i;
+        while j > 0 && cmp_click_in_mb(&slice[j - 1], &key) == std::cmp::Ordering::Greater {
+            slice[j] = slice[j - 1];
+            j -= 1;
+        }
+        slice[j] = key;
+    }
+}
+
+#[inline(always)]
+fn sort_and_dedup_clicks_mb(slice: &mut [CleanClick]) -> usize {
+    let len = slice.len();
+    if len == 0 {
+        return 0;
+    }
+    if len == 1 {
+        return 1;
+    }
+    if len <= 32 {
+        insertion_sort_clicks(slice);
+    } else {
+        slice.sort_unstable_by(cmp_click_in_mb);
+    }
+    let mut write = 1usize;
+    for read in 1..len {
+        let a = unsafe { *slice.get_unchecked(write - 1) };
+        let b = unsafe { *slice.get_unchecked(read) };
+        if !(a.canonical_user == b.canonical_user && a.rel_ts == b.rel_ts && a.click_id == b.click_id)
+        {
+            if write != read {
+                unsafe {
+                    *slice.get_unchecked_mut(write) = b;
+                }
+            }
+            write += 1;
+        }
+    }
+    write
+}
+
 pub fn process_sessions(
     mut event_shards: Vec<Vec<CleanEvent>>,
     dedup_threads: usize,
@@ -91,7 +367,6 @@ pub fn process_sessions(
         };
     }
 
-    // Order user buckets largest-first so whale/kiosk buckets start immediately.
     let mut bucket_order: Vec<(usize, usize)> = (0..USER_BUCKETS)
         .map(|b| {
             let sz: usize = (0..dedup_threads)
@@ -118,7 +393,6 @@ pub fn process_sessions(
     let window_start = lookups.window_start;
     let start_epoch_day = lookups.start_epoch_day;
 
-    // Move each bucket's shards into a Vec per bucket first (zero copy of elements!).
     let mut bucket_events_shards: Vec<Vec<Vec<CleanEvent>>> =
         (0..USER_BUCKETS).map(|_| Vec::new()).collect();
     for t in 0..dedup_threads {
@@ -161,10 +435,17 @@ pub fn process_sessions(
                 let mut user_buf = UserDailyBuffer::default();
                 let mut camp_stats = vec![CampaignDayStat::default(); num_campaigns * num_days];
                 let mut events: Vec<CleanEvent> = Vec::new();
+                let mut ev_part: Vec<CleanEvent> = Vec::new();
+                let mut rel_scratch: Vec<CleanEvent> = Vec::new();
                 let mut clicks: Vec<CleanClick> = Vec::new();
+                let mut ck_part: Vec<CleanClick> = Vec::new();
                 let mut cat_rev: Vec<i64> = vec![0i64; num_cats];
                 let mut last_seen_gen: Vec<u32> = vec![0u32; num_campaigns];
                 let mut session_gen: u32 = 0;
+                let mut whale_assist = WhaleAssistState::new(num_campaigns);
+
+                let mut ev_offsets = [0usize; MICRO_BUCKETS + 1];
+                let mut ck_offsets = [0usize; MICRO_BUCKETS + 1];
 
                 let mut copy_ns = 0u64;
                 let mut ev_sort_ns = 0u64;
@@ -197,75 +478,89 @@ pub fn process_sessions(
                     }
 
                     let t_es = if timing { Some(Instant::now()) } else { None };
-                    events.sort_unstable_by_key(|a| {
-                        ((a.canonical_user as u128) << 32) | (a.rel_ts as u128)
-                    });
+                    radix_partition_events(&events, &mut ev_part, &mut ev_offsets);
                     if let Some(t) = t_es {
                         ev_sort_ns += t.elapsed().as_nanos() as u64;
                     }
 
                     let t_cs = if timing { Some(Instant::now()) } else { None };
                     if !clicks.is_empty() {
-                        clicks.sort_unstable_by(|a, b| {
-                            a.canonical_user
-                                .cmp(&b.canonical_user)
-                                .then_with(|| a.rel_ts.cmp(&b.rel_ts))
-                                .then_with(|| cmp_id(b.click_id, a.click_id))
-                        });
-                        clicks.dedup_by(|a, b| {
-                            a.canonical_user == b.canonical_user
-                                && a.rel_ts == b.rel_ts
-                                && a.click_id == b.click_id
-                        });
+                        radix_partition_clicks(&clicks, &mut ck_part, &mut ck_offsets);
+                    } else {
+                        ck_offsets.fill(0);
                     }
                     if let Some(t) = t_cs {
                         ck_sort_ns += t.elapsed().as_nanos() as u64;
                     }
 
-                    let t_co = if timing { Some(Instant::now()) } else { None };
-                    let mut ev_idx = 0usize;
-                    let mut ck_idx = 0usize;
-                    let ev_len = events.len();
-                    let ck_len = clicks.len();
-
-                    while ev_idx < ev_len {
-                        let user_id = events[ev_idx].canonical_user;
-                        let ev_start = ev_idx;
-                        while ev_idx < ev_len && events[ev_idx].canonical_user == user_id {
-                            ev_idx += 1;
+                    let t_mb_loop = if timing { Some(Instant::now()) } else { None };
+                    for mb in 0..MICRO_BUCKETS {
+                        let ev_start_mb = ev_offsets[mb];
+                        let ev_end_mb = ev_offsets[mb + 1];
+                        if ev_start_mb == ev_end_mb {
+                            continue;
                         }
-                        let u_events = &events[ev_start..ev_idx];
-                        if timing && u_events.len() > max_user_events {
-                            max_user_events = u_events.len();
+                        let ev_mb = &mut ev_part[ev_start_mb..ev_end_mb];
+
+                        if ev_mb.len() > 1 {
+                            ev_mb.sort_unstable_by_key(|e| e.canonical_user);
                         }
 
-                        while ck_idx < ck_len && clicks[ck_idx].canonical_user < user_id {
-                            ck_idx += 1;
-                        }
-                        let ck_start = ck_idx;
-                        while ck_idx < ck_len && clicks[ck_idx].canonical_user == user_id {
-                            ck_idx += 1;
-                        }
-                        let u_clicks = &clicks[ck_start..ck_idx];
+                        let ck_start_mb = ck_offsets[mb];
+                        let ck_end_mb = ck_offsets[mb + 1];
+                        let ck_mb_len =
+                            sort_and_dedup_clicks_mb(&mut ck_part[ck_start_mb..ck_end_mb]);
+                        let u_clicks_mb = &ck_part[ck_start_mb..ck_start_mb + ck_mb_len];
 
-                        let iters = process_user(
-                            user_id,
-                            u_events,
-                            u_clicks,
-                            window_start,
-                            start_epoch_day,
-                            num_days,
-                            &mut cat_rev,
-                            &mut last_seen_gen,
-                            &mut session_gen,
-                            &mut user_buf,
-                            &mut camp_stats,
-                        );
-                        if timing {
-                            click_window_iters += iters;
+                        let mut ev_idx = 0usize;
+                        let mut ck_idx = 0usize;
+                        let ev_len = ev_mb.len();
+
+                        while ev_idx < ev_len {
+                            let user_id = ev_mb[ev_idx].canonical_user;
+                            let ev_start = ev_idx;
+                            while ev_idx < ev_len && ev_mb[ev_idx].canonical_user == user_id {
+                                ev_idx += 1;
+                            }
+                            let u_events = &mut ev_mb[ev_start..ev_idx];
+                            sort_user_events_by_ts(u_events, &mut rel_scratch);
+
+                            if timing && u_events.len() > max_user_events {
+                                max_user_events = u_events.len();
+                            }
+
+                            while ck_idx < ck_mb_len && u_clicks_mb[ck_idx].canonical_user < user_id
+                            {
+                                ck_idx += 1;
+                            }
+                            let ck_start = ck_idx;
+                            while ck_idx < ck_mb_len && u_clicks_mb[ck_idx].canonical_user == user_id
+                            {
+                                ck_idx += 1;
+                            }
+                            let u_clicks = &u_clicks_mb[ck_start..ck_idx];
+
+                            let iters = process_user(
+                                user_id,
+                                u_events,
+                                u_clicks,
+                                window_start,
+                                start_epoch_day,
+                                num_days,
+                                num_campaigns,
+                                &mut cat_rev,
+                                &mut last_seen_gen,
+                                &mut session_gen,
+                                &mut whale_assist,
+                                &mut user_buf,
+                                &mut camp_stats,
+                            );
+                            if timing {
+                                click_window_iters += iters;
+                            }
                         }
                     }
-                    if let Some(t) = t_co {
+                    if let Some(t) = t_mb_loop {
                         core_ns += t.elapsed().as_nanos() as u64;
                     }
                 }
@@ -354,15 +649,18 @@ fn process_user(
     window_start: i64,
     start_epoch_day: i32,
     num_days: usize,
+    num_campaigns: usize,
     cat_rev: &mut [i64],
     last_seen_gen: &mut [u32],
     session_gen: &mut u32,
+    whale_assist: &mut WhaleAssistState,
     user_buf: &mut UserDailyBuffer,
     camp_stats: &mut [CampaignDayStat],
 ) -> u64 {
     let mut c_left = 0usize;
     let mut c_right = 0usize;
     let c_len = u_clicks.len();
+    let use_sliding_assist = c_len > 32 && num_campaigns <= u16::MAX as usize;
     let mut assist_iters = 0u64;
 
     let mut cur_day_idx = usize::MAX;
@@ -444,14 +742,27 @@ fn process_user(
         let min_ck_rel = session_start_rel as i64;
         let max_ck_rel = min_ck_rel + SEVEN_DAYS_MS;
 
-        while c_left < c_len && (u_clicks[c_left].rel_ts as i64) < min_ck_rel {
-            c_left += 1;
-        }
-        if c_right < c_left {
-            c_right = c_left;
-        }
-        while c_right < c_len && (u_clicks[c_right].rel_ts as i64) <= max_ck_rel {
-            c_right += 1;
+        if use_sliding_assist {
+            while c_right < c_len && (u_clicks[c_right].rel_ts as i64) <= max_ck_rel {
+                whale_assist.add(unsafe { u_clicks.get_unchecked(c_right).campaign_idx as usize });
+                c_right += 1;
+                assist_iters += 1;
+            }
+            while c_left < c_right && (u_clicks[c_left].rel_ts as i64) < min_ck_rel {
+                whale_assist.remove(unsafe { u_clicks.get_unchecked(c_left).campaign_idx as usize });
+                c_left += 1;
+                assist_iters += 1;
+            }
+        } else {
+            while c_left < c_len && (u_clicks[c_left].rel_ts as i64) < min_ck_rel {
+                c_left += 1;
+            }
+            if c_right < c_left {
+                c_right = c_left;
+            }
+            while c_right < c_len && (u_clicks[c_right].rel_ts as i64) <= max_ck_rel {
+                c_right += 1;
+            }
         }
 
         if c_left == c_right {
@@ -470,25 +781,40 @@ fn process_user(
                 slot.revenue_cents += sess_rev;
             }
 
-            *session_gen = session_gen.wrapping_add(1);
-            if *session_gen == 0 {
-                last_seen_gen.fill(0);
-                *session_gen = 1;
-            }
-            let gen_val = *session_gen;
-            assist_iters += (c_right - c_left) as u64;
-            for ck in &u_clicks[c_left..c_right] {
-                let c = ck.campaign_idx as usize;
-                unsafe {
-                    if *last_seen_gen.get_unchecked(c) != gen_val {
-                        *last_seen_gen.get_unchecked_mut(c) = gen_val;
+            if use_sliding_assist {
+                for &c in &whale_assist.active {
+                    unsafe {
                         camp_stats
-                            .get_unchecked_mut(c * num_days + sess_day_idx)
+                            .get_unchecked_mut(c as usize * num_days + sess_day_idx)
                             .assisted_sessions += 1;
+                    }
+                    assist_iters += 1;
+                }
+            } else {
+                *session_gen = session_gen.wrapping_add(1);
+                if *session_gen == 0 {
+                    last_seen_gen.fill(0);
+                    *session_gen = 1;
+                }
+                let gen_val = *session_gen;
+                assist_iters += (c_right - c_left) as u64;
+                for ck in &u_clicks[c_left..c_right] {
+                    let c = ck.campaign_idx as usize;
+                    unsafe {
+                        if *last_seen_gen.get_unchecked(c) != gen_val {
+                            *last_seen_gen.get_unchecked_mut(c) = gen_val;
+                            camp_stats
+                                .get_unchecked_mut(c * num_days + sess_day_idx)
+                                .assisted_sessions += 1;
+                        }
                     }
                 }
             }
         }
+    }
+
+    if use_sliding_assist {
+        whale_assist.clear();
     }
 
     if day_sessions > 0 {
