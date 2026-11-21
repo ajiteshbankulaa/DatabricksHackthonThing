@@ -8,7 +8,7 @@ use crate::csv::{find_header_end, list_csv_files, read_exact_at, scan_csv_chunk}
 use crate::id::{EMPTY_ID, mix64, pack_id};
 use crate::links::LinkMap;
 use crate::lookup::{Lookups, NON_PURCHASE_CAT};
-use crate::timestamp::{DAY_MS, parse_f1, parse_price_cents, parse_ts};
+use crate::timestamp::{DAY_MS, parse_f1_fast, parse_price_cents, parse_ts_fast};
 
 pub const EVENT_BUCKETS: usize = 256;
 pub const USER_BUCKETS: usize = 256;
@@ -298,14 +298,14 @@ pub fn scan_events_and_clicks(
                                     if f[0].is_empty() {
                                         return;
                                     }
-                                    let Some(ingest_ts) = parse_f1(f[3]) else {
+                                    let Some(ingest_ts) = parse_f1_fast(f[3], &lookups.date_table) else {
                                         return;
                                     };
                                     let event_id = pack_id(f[0]);
                                     let mut valid = !f[1].is_empty();
                                     let mut rel_ts = 0u32;
                                     if valid {
-                                        if let Some(ts) = parse_ts(f[2]) {
+                                        if let Some(ts) = parse_ts_fast(f[2], &lookups.date_table) {
                                             if ts >= lookups.window_start
                                                 && ts < lookups.window_end
                                                 && ingest_ts - ts <= DAY_MS
@@ -375,7 +375,7 @@ pub fn scan_events_and_clicks(
                                     if campaign_idx == 0 {
                                         return;
                                     }
-                                    let Some(ts) = parse_ts(f[3]) else {
+                                    let Some(ts) = parse_ts_fast(f[3], &lookups.date_table) else {
                                         return;
                                     };
                                     if ts < lookups.click_start || ts >= lookups.click_end {

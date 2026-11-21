@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::csv::read_whole_csv;
 use crate::id::pack_id;
-use crate::timestamp::{DAY_MS, SEVEN_DAYS_MS, parse_ts};
+use crate::timestamp::{DAY_MS, DateTable, SEVEN_DAYS_MS, parse_ts};
 
 pub const NON_PURCHASE_CAT: u8 = 255;
 
@@ -20,6 +20,7 @@ pub struct Lookups {
     pub click_end: i64,
     pub start_epoch_day: i32,
     pub num_days: usize,
+    pub date_table: DateTable,
 
     pub categories: Vec<Vec<u8>>,
     pub unknown_cat_id: u8,
@@ -128,6 +129,7 @@ impl Lookups {
             click_end,
             start_epoch_day,
             num_days,
+            date_table: DateTable::for_window_start(window_start),
             categories: cat_set,
             unknown_cat_id,
             fast_products,

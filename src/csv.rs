@@ -2,29 +2,6 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-#[inline(always)]
-pub fn unquote_field(s: &[u8]) -> Option<&[u8]> {
-    let len = s.len();
-    if len == 0 {
-        return Some(s);
-    }
-    if s[0] == b'"' {
-        if len < 2 || s[len - 1] != b'"' {
-            return None;
-        }
-        let inner = &s[1..len - 1];
-        if inner.contains(&b'"') {
-            return None;
-        }
-        Some(inner)
-    } else {
-        if s.contains(&b'"') {
-            return None;
-        }
-        Some(s)
-    }
-}
-
 /// Reads bytes at `offset` until `buf` is filled or EOF.
 pub fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
@@ -148,18 +125,18 @@ fn dispatch_row<const N: usize, F>(
     buf: &[u8],
     line_start: usize,
     field_ends: &[usize; N],
-    line_has_quote: bool,
+    field_quote_bits: u8,
     on_row: &mut F,
 ) where
     F: FnMut([&[u8]; N]),
 {
     let mut fields: [&[u8]; N] = [&[]; N];
     let mut s = line_start;
-    if !line_has_quote {
+    if field_quote_bits == 0 {
         let mut i = 0;
         while i < N {
             let e = field_ends[i];
-            fields[i] = &buf[s..e];
+            fields[i] = unsafe { buf.get_unchecked(s..e) };
             s = e + 1;
             i += 1;
         }
@@ -167,10 +144,19 @@ fn dispatch_row<const N: usize, F>(
         let mut i = 0;
         while i < N {
             let e = field_ends[i];
-            let raw = &buf[s..e];
-            match unquote_field(raw) {
-                Some(clean) => fields[i] = clean,
-                None => return,
+            let raw = unsafe { buf.get_unchecked(s..e) };
+            if ((field_quote_bits >> i) & 1) == 0 {
+                fields[i] = raw;
+            } else {
+                let rlen = raw.len();
+                if rlen < 2 || raw[0] != b'"' || raw[rlen - 1] != b'"' {
+                    return;
+                }
+                let inner = unsafe { raw.get_unchecked(1..rlen - 1) };
+                if inner.contains(&b'"') {
+                    return;
+                }
+                fields[i] = inner;
             }
             s = e + 1;
             i += 1;
@@ -187,12 +173,19 @@ where
     F: FnMut([&[u8]; N]),
 {
     debug_assert!(buf.len() >= len + 64);
+    debug_assert!(N <= 8);
     if len == 0 {
         return;
     }
 
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx512vl") && std::is_x86_feature_detected!("avx512bw") {
+            unsafe {
+                scan_csv_avx512vl::<N, F>(buf, len, &mut on_row);
+            }
+            return;
+        }
         if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") {
             unsafe {
                 scan_csv_avx512::<N, F>(buf, len, &mut on_row);
@@ -208,6 +201,134 @@ where
     }
 
     scan_csv_swar::<N, F>(buf, len, &mut on_row);
+}
+
+#[inline(always)]
+fn process_block_masks<const N: usize, F>(
+    buf: &[u8],
+    offset: usize,
+    nl_mask: u64,
+    comma_mask: u64,
+    quote_mask: u64,
+    line_start: &mut usize,
+    field_idx: &mut usize,
+    field_ends: &mut [usize; N],
+    field_quote_bits: &mut u8,
+    cur_field_quoted: &mut bool,
+    on_row: &mut F,
+) where
+    F: FnMut([&[u8]; N]),
+{
+    let mut delim_mask = nl_mask | comma_mask;
+    let mut prev_bit = 0usize;
+    while delim_mask != 0 {
+        let bit = delim_mask.trailing_zeros() as usize;
+        let pos = offset + bit;
+        if quote_mask != 0 {
+            let span_mask = ((1u64 << (bit - prev_bit)) - 1) << prev_bit;
+            if (quote_mask & span_mask) != 0 {
+                *cur_field_quoted = true;
+            }
+        }
+        if ((nl_mask >> bit) & 1) != 0 {
+            if *field_idx == N - 1 {
+                field_ends[N - 1] = pos;
+                if *cur_field_quoted {
+                    *field_quote_bits |= 1u8 << (N - 1);
+                }
+                dispatch_row::<N, F>(buf, *line_start, field_ends, *field_quote_bits, on_row);
+            }
+            *line_start = pos + 1;
+            *field_idx = 0;
+            *field_quote_bits = 0;
+            *cur_field_quoted = false;
+        } else {
+            if *field_idx < N {
+                field_ends[*field_idx] = pos;
+                if *cur_field_quoted {
+                    *field_quote_bits |= 1u8 << *field_idx;
+                }
+            }
+            *field_idx += 1;
+            *cur_field_quoted = false;
+        }
+        prev_bit = bit + 1;
+        delim_mask &= delim_mask - 1;
+    }
+    if quote_mask != 0 && prev_bit < 64 && (quote_mask >> prev_bit) != 0 {
+        *cur_field_quoted = true;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vl,avx512bw")]
+unsafe fn scan_csv_avx512vl<const N: usize, F>(buf: &[u8], len: usize, on_row: &mut F)
+where
+    F: FnMut([&[u8]; N]),
+{
+    use std::arch::x86_64::*;
+
+    let ptr = buf.as_ptr();
+    let v_nl = _mm256_set1_epi8(b'\n' as i8);
+    let v_comma = _mm256_set1_epi8(b',' as i8);
+    let v_quote = _mm256_set1_epi8(b'"' as i8);
+
+    let mut line_start = 0usize;
+    let mut field_idx = 0usize;
+    let mut field_ends = [0usize; N];
+    let mut field_quote_bits = 0u8;
+    let mut cur_field_quoted = false;
+
+    let mut offset = 0usize;
+    while offset < len {
+        let (mut nl_mask, mut comma_mask, mut quote_mask) = unsafe {
+            let c0 = _mm256_loadu_si256(ptr.add(offset) as *const __m256i);
+            let c1 = _mm256_loadu_si256(ptr.add(offset + 32) as *const __m256i);
+
+            let nl0 = _mm256_cmpeq_epi8_mask(c0, v_nl) as u64;
+            let nl1 = _mm256_cmpeq_epi8_mask(c1, v_nl) as u64;
+
+            let cm0 = _mm256_cmpeq_epi8_mask(c0, v_comma) as u64;
+            let cm1 = _mm256_cmpeq_epi8_mask(c1, v_comma) as u64;
+
+            let qt0 = _mm256_cmpeq_epi8_mask(c0, v_quote) as u64;
+            let qt1 = _mm256_cmpeq_epi8_mask(c1, v_quote) as u64;
+
+            (nl0 | (nl1 << 32), cm0 | (cm1 << 32), qt0 | (qt1 << 32))
+        };
+
+        let rem = len - offset;
+        if rem < 64 {
+            let valid = (1u64 << rem) - 1;
+            nl_mask &= valid;
+            comma_mask &= valid;
+            quote_mask &= valid;
+        }
+
+        process_block_masks::<N, F>(
+            buf,
+            offset,
+            nl_mask,
+            comma_mask,
+            quote_mask,
+            &mut line_start,
+            &mut field_idx,
+            &mut field_ends,
+            &mut field_quote_bits,
+            &mut cur_field_quoted,
+            on_row,
+        );
+
+        offset += 64;
+    }
+
+    if line_start < len && field_idx == N - 1 {
+        field_ends[N - 1] = len;
+        if cur_field_quoted {
+            field_quote_bits |= 1u8 << (N - 1);
+        }
+        dispatch_row::<N, F>(buf, line_start, &field_ends, field_quote_bits, on_row);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -226,7 +347,8 @@ where
     let mut line_start = 0usize;
     let mut field_idx = 0usize;
     let mut field_ends = [0usize; N];
-    let mut line_has_quote = false;
+    let mut field_quote_bits = 0u8;
+    let mut cur_field_quoted = false;
 
     let mut offset = 0usize;
     while offset < len {
@@ -247,41 +369,29 @@ where
             quote_mask &= valid;
         }
 
-        if quote_mask != 0 {
-            line_has_quote = true;
-        }
-
-        let mut delim_mask = nl_mask | comma_mask;
-        while delim_mask != 0 {
-            let bit = delim_mask.trailing_zeros() as usize;
-            let pos = offset + bit;
-            if ((nl_mask >> bit) & 1) != 0 {
-                if field_idx == N - 1 {
-                    field_ends[N - 1] = pos;
-                    dispatch_row::<N, F>(buf, line_start, &field_ends, line_has_quote, on_row);
-                }
-                line_start = pos + 1;
-                field_idx = 0;
-                line_has_quote = if bit < 63 {
-                    (quote_mask >> (bit + 1)) != 0
-                } else {
-                    false
-                };
-            } else {
-                if field_idx < N {
-                    field_ends[field_idx] = pos;
-                }
-                field_idx += 1;
-            }
-            delim_mask &= delim_mask - 1;
-        }
+        process_block_masks::<N, F>(
+            buf,
+            offset,
+            nl_mask,
+            comma_mask,
+            quote_mask,
+            &mut line_start,
+            &mut field_idx,
+            &mut field_ends,
+            &mut field_quote_bits,
+            &mut cur_field_quoted,
+            on_row,
+        );
 
         offset += 64;
     }
 
     if line_start < len && field_idx == N - 1 {
         field_ends[N - 1] = len;
-        dispatch_row::<N, F>(buf, line_start, &field_ends, line_has_quote, on_row);
+        if cur_field_quoted {
+            field_quote_bits |= 1u8 << (N - 1);
+        }
+        dispatch_row::<N, F>(buf, line_start, &field_ends, field_quote_bits, on_row);
     }
 }
 
@@ -301,7 +411,8 @@ where
     let mut line_start = 0usize;
     let mut field_idx = 0usize;
     let mut field_ends = [0usize; N];
-    let mut line_has_quote = false;
+    let mut field_quote_bits = 0u8;
+    let mut cur_field_quoted = false;
 
     let mut offset = 0usize;
     while offset < len {
@@ -329,49 +440,36 @@ where
             quote_mask &= valid;
         }
 
-        if quote_mask != 0 {
-            line_has_quote = true;
-        }
-
-        let mut delim_mask = nl_mask | comma_mask;
-        while delim_mask != 0 {
-            let bit = delim_mask.trailing_zeros() as usize;
-            let pos = offset + bit;
-            if ((nl_mask >> bit) & 1) != 0 {
-                if field_idx == N - 1 {
-                    field_ends[N - 1] = pos;
-                    dispatch_row::<N, F>(buf, line_start, &field_ends, line_has_quote, on_row);
-                }
-                line_start = pos + 1;
-                field_idx = 0;
-                line_has_quote = if bit < 63 {
-                    (quote_mask >> (bit + 1)) != 0
-                } else {
-                    false
-                };
-            } else {
-                if field_idx < N {
-                    field_ends[field_idx] = pos;
-                }
-                field_idx += 1;
-            }
-            delim_mask &= delim_mask - 1;
-        }
+        process_block_masks::<N, F>(
+            buf,
+            offset,
+            nl_mask,
+            comma_mask,
+            quote_mask,
+            &mut line_start,
+            &mut field_idx,
+            &mut field_ends,
+            &mut field_quote_bits,
+            &mut cur_field_quoted,
+            on_row,
+        );
 
         offset += 64;
     }
 
     if line_start < len && field_idx == N - 1 {
         field_ends[N - 1] = len;
-        dispatch_row::<N, F>(buf, line_start, &field_ends, line_has_quote, on_row);
+        if cur_field_quoted {
+            field_quote_bits |= 1u8 << (N - 1);
+        }
+        dispatch_row::<N, F>(buf, line_start, &field_ends, field_quote_bits, on_row);
     }
 }
 
 #[inline(always)]
 fn has_eq_mask(word: u64, byte_splat: u64) -> u64 {
     let x = word ^ byte_splat;
-    let m = (x.wrapping_sub(0x0101_0101_0101_0101)) & !x & 0x8080_8080_8080_8080;
-    m
+    (x.wrapping_sub(0x0101_0101_0101_0101)) & !x & 0x8080_8080_8080_8080
 }
 
 fn scan_csv_swar<const N: usize, F>(buf: &[u8], len: usize, on_row: &mut F)
@@ -385,7 +483,8 @@ where
     let mut line_start = 0usize;
     let mut field_idx = 0usize;
     let mut field_ends = [0usize; N];
-    let mut line_has_quote = false;
+    let mut field_quote_bits = 0u8;
+    let mut cur_field_quoted = false;
 
     let mut offset = 0usize;
     while offset < len {
@@ -402,34 +501,45 @@ where
             quote_mask &= valid;
         }
 
-        if quote_mask != 0 {
-            line_has_quote = true;
-        }
-
         let mut delim_mask = nl_mask | comma_mask;
+        let mut prev_bit = 0usize;
         while delim_mask != 0 {
             let bit_msb = delim_mask.trailing_zeros() as usize;
             let byte_idx = bit_msb >> 3;
             let pos = offset + byte_idx;
+            if quote_mask != 0 {
+                let span_mask = ((1u64 << (bit_msb - prev_bit)) - 1) << prev_bit;
+                if (quote_mask & span_mask) != 0 {
+                    cur_field_quoted = true;
+                }
+            }
             if ((nl_mask >> bit_msb) & 1) != 0 {
                 if field_idx == N - 1 {
                     field_ends[N - 1] = pos;
-                    dispatch_row::<N, F>(buf, line_start, &field_ends, line_has_quote, on_row);
+                    if cur_field_quoted {
+                        field_quote_bits |= 1u8 << (N - 1);
+                    }
+                    dispatch_row::<N, F>(buf, line_start, &field_ends, field_quote_bits, on_row);
                 }
                 line_start = pos + 1;
                 field_idx = 0;
-                line_has_quote = if bit_msb < 63 {
-                    (quote_mask >> (bit_msb + 1)) != 0
-                } else {
-                    false
-                };
+                field_quote_bits = 0;
+                cur_field_quoted = false;
             } else {
                 if field_idx < N {
                     field_ends[field_idx] = pos;
+                    if cur_field_quoted {
+                        field_quote_bits |= 1u8 << field_idx;
+                    }
                 }
                 field_idx += 1;
+                cur_field_quoted = false;
             }
+            prev_bit = bit_msb + 1;
             delim_mask &= delim_mask - 1;
+        }
+        if quote_mask != 0 && prev_bit < 64 && (quote_mask >> prev_bit) != 0 {
+            cur_field_quoted = true;
         }
 
         offset += 8;
@@ -437,7 +547,10 @@ where
 
     if line_start < len && field_idx == N - 1 {
         field_ends[N - 1] = len;
-        dispatch_row::<N, F>(buf, line_start, &field_ends, line_has_quote, on_row);
+        if cur_field_quoted {
+            field_quote_bits |= 1u8 << (N - 1);
+        }
+        dispatch_row::<N, F>(buf, line_start, &field_ends, field_quote_bits, on_row);
     }
 }
 
@@ -481,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_csv_dialect_edge_cases() {
-        let raw = b"a,b\n\"u1\",u2\nu1,u2,u3\nu1,\"u2\"x\n\n\"\",v\r\nno_nl_last,ok";
+        let raw = b"a,b\n\"u1\",u2\nu1,u2,u3\nu1,\"u2\"x\n\n\"\",v\r\n\"very_long_user_identifier_0123456789012345678901234567890123456789\",ok_long\nno_nl_last,ok";
         let mut padded = raw.to_vec();
         let len = padded.len();
         padded.resize(len + 64, 0);
@@ -497,6 +610,10 @@ mod tests {
             (b"a".to_vec(), b"b".to_vec()),
             (b"u1".to_vec(), b"u2".to_vec()),
             (b"".to_vec(), b"v\r".to_vec()),
+            (
+                b"very_long_user_identifier_0123456789012345678901234567890123456789".to_vec(),
+                b"ok_long".to_vec(),
+            ),
             (b"no_nl_last".to_vec(), b"ok".to_vec()),
         ];
         assert_eq!(rows_simd, expected);
