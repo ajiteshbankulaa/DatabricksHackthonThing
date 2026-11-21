@@ -21,6 +21,32 @@ struct LinkSlot {
     val: u64,
 }
 
+#[cfg(target_os = "linux")]
+#[inline]
+fn advise_hugepage(ptr: *const u8, len_bytes: usize) {
+    if len_bytes < 2 * 1024 * 1024 {
+        return;
+    }
+    unsafe extern "C" {
+        fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
+    }
+    const MADV_HUGEPAGE: i32 = 14;
+    let addr = ptr as usize;
+    let aligned_addr = addr & !4095usize;
+    let aligned_len = len_bytes + (addr - aligned_addr);
+    unsafe {
+        madvise(
+            aligned_addr as *mut core::ffi::c_void,
+            aligned_len,
+            MADV_HUGEPAGE,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline(always)]
+fn advise_hugepage(_ptr: *const u8, _len_bytes: usize) {}
+
 pub struct LinkMap {
     slots: Vec<LinkSlot>,
     mask: usize,
@@ -147,6 +173,7 @@ impl LinkMap {
             };
             cap
         ];
+        advise_hugepage(slots.as_ptr() as *const u8, cap * std::mem::size_of::<LinkSlot>());
         let est_nodes = total_edges.min(1 << 22);
         let mut parent: Vec<u32> = Vec::with_capacity(est_nodes);
         let mut node_uid: Vec<u64> = Vec::with_capacity(est_nodes);
@@ -184,8 +211,25 @@ impl LinkMap {
             }
         }
 
+        const EDGE_PREFETCH_DIST: usize = 16;
         for vec in edge_vecs {
-            for &(a, b) in vec {
+            let n = vec.len();
+            for i in 0..n {
+                if i + EDGE_PREFETCH_DIST < n {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        let (pa, pb) = *vec.get_unchecked(i + EDGE_PREFETCH_DIST);
+                        let ia = (mix64(pa) as usize) & mask;
+                        let ib = (mix64(pb) as usize) & mask;
+                        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                            slots.as_ptr().add(ia) as *const i8,
+                        );
+                        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                            slots.as_ptr().add(ib) as *const i8,
+                        );
+                    }
+                }
+                let (a, b) = unsafe { *vec.get_unchecked(i) };
                 let u = get_or_insert(&mut slots, mask, &mut parent, &mut node_uid, &mut node_slot, a);
                 let v = get_or_insert(&mut slots, mask, &mut parent, &mut node_uid, &mut node_slot, b);
                 unite_rem(&mut parent, u, v);

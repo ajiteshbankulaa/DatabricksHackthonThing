@@ -8,18 +8,19 @@ COPY Cargo.toml ./
 COPY src ./src
 COPY generator ./generator
 
-# 1. Build dataset generator and create a 2M-event PGO training dataset
+# 1. Build dataset generator & instrumented binary, collect NCPU=8 PGO profiles across 3 seeds
 RUN cargo build --release --manifest-path generator/Cargo.toml && \
-    ./generator/target/release/generate --seed 42 --events 2000000 --clicks 500000 --output /tmp/pgo_data
-
-# 2. Build instrumented binary, collect profile on host microarchitecture, merge profile
-RUN RUSTFLAGS="-C target-cpu=native -C profile-generate=/tmp/pgo" cargo build --release && \
-    PGO_TRAIN=1 NCPU=4 ./target/release/shopping-sessions /tmp/pgo_data /tmp/pgo_out && \
+    RUSTFLAGS="-C target-cpu=native -C profile-generate=/tmp/pgo" cargo build --release && \
+    for seed in 1 42 99; do \
+        ./generator/target/release/generate --seed "$seed" --events 2000000 --clicks 500000 --output /tmp/pgo_data && \
+        PGO_TRAIN=1 NCPU=8 ./target/release/shopping-sessions /tmp/pgo_data /tmp/pgo_out && \
+        rm -rf /tmp/pgo_data /tmp/pgo_out || exit 1; \
+    done && \
     LLVM_PROFDATA="$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -n 1)" && \
     "$LLVM_PROFDATA" merge -o /tmp/pgo/merged.profdata /tmp/pgo/*.profraw && \
-    rm -rf /tmp/pgo_data /tmp/pgo_out
+    rm -f /tmp/pgo/*.profraw
 
-# 3. Recompile final binary with PGO + native target tuning
+# 2. Recompile final binary with merged PGO + native target tuning
 RUN RUSTFLAGS="-C target-cpu=native -C profile-use=/tmp/pgo/merged.profdata -C llvm-args=-pgo-warn-missing-function" cargo build --release && \
     rm -rf /tmp/pgo
 
