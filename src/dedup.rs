@@ -5,7 +5,7 @@ use crate::id::{EMPTY_ID, mix64};
 use crate::links::LinkMap;
 use crate::scan::{EVENT_BUCKETS, INVALID_MARKER, RawEvent, USER_BUCKETS};
 
-const SUB_PARTITIONS: usize = 16;
+const SUB_PARTITIONS: usize = 64;
 const PREFETCH_DIST: usize = 16;
 
 #[derive(Default, Clone, Copy)]
@@ -243,7 +243,7 @@ pub fn dedup_events(
                         let mut counts = [0usize; SUB_PARTITIONS];
                         for t in 0..scan_threads {
                             for ev in &raw_shards[t * EVENT_BUCKETS + b] {
-                                let sp = ((mix64(ev.event_id) >> 8) as usize) & (SUB_PARTITIONS - 1);
+                                let sp = ((mix64(ev.event_id) >> 6) as usize) & (SUB_PARTITIONS - 1);
                                 counts[sp] += 1;
                             }
                         }
@@ -273,7 +273,7 @@ pub fn dedup_events(
                             for j in 0..r_slice.len() {
                                 let ev = unsafe { *r_slice.get_unchecked(j) };
                                 let ing = unsafe { *i_slice.get_unchecked(j) };
-                                let sp = ((mix64(ev.event_id) >> 8) as usize) & (SUB_PARTITIONS - 1);
+                                let sp = ((mix64(ev.event_id) >> 6) as usize) & (SUB_PARTITIONS - 1);
                                 let pos = cursors[sp];
                                 cursors[sp] = pos + 1;
                                 unsafe {

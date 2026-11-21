@@ -10,7 +10,7 @@ use crate::links::LinkMap;
 use crate::lookup::{Lookups, NON_PURCHASE_CAT};
 use crate::timestamp::{DAY_MS, parse_f1_fast, parse_price_cents, parse_ts_fast};
 
-pub const EVENT_BUCKETS: usize = 256;
+pub const EVENT_BUCKETS: usize = 64;
 pub const USER_BUCKETS: usize = 256;
 pub const INVALID_MARKER: u32 = u32::MAX;
 const SCAN_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
